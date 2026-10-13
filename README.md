@@ -141,58 +141,8 @@ Ayarlar:
 
 ---
 
-## 6) Sürüm Yayınlama (Uygulama İçinden Güncelleme)
 
-### A) GitHub Actions ile (otomatik, önerilen)
-
-1. Repoyu GitHub'a yükleyin: `git init && git add -A && git commit -m "baslangic"`
-2. Repo → **Settings → Secrets and variables → Actions** → aşağıdakileri ekleyin:
-
-| Secret | Değer |
-|---|---|
-| `ANDROID_KEYSTORE_B64` | `release.keystore` dosyasının base64'ü (aşağıdaki komut) |
-| `KEYSTORE_PASSWORD` | `keystore.properties` içindeki şifre |
-| `KEY_PASSWORD` | aynı şifre |
-| `KEY_ALIAS` | `gizli` |
-| `UPDATE_PRIVATE_KEY` | `tools\update_key_private.b64` içeriği (base64) |
-| `UPDATE_PUBLIC_KEY` | `tools\update_key_public.b64` içeriği (base64) |
-
-   ```powershell
-   [Convert]::ToBase64String([IO.File]::ReadAllBytes("release.keystore"))
-   ```
-3. Uygulamadaki güncelleme adresi repoya göre **yeniden derlenmeli**:
-   ilk sürümü **workflow_dispatch** ile yayınlarken akış `-PupdateUrl=...` zaten
-   repoyu kullanır; siz lokalde sadece `UPDATE_MANIFEST_URL` varsayılanını
-   kendi reponuza göre düzeltin (`app/build.gradle.kts` içindeki `CHANGE_ME`).
-4. Actions → **nullnet Surum Yayinla** → `Run workflow` → `versionCode` (arttır!),
-   `versionName`, notlar → Run.
-   - Akış: imzalı APK + `update.json` üretir ve GitHub Release'e ekler.
-   - Etiketi `v*` ile iterseniz de tetiklenir.
-5. Kullanıcılar uygulama içinde **Güncelleme → kontrol et → indir ve kur**.
-
-Otomatik kontrol uygulama içinde **sadece manuel** yapılır (istediğinizde). Bu,
-teyit edilmemiş sürüm pop-up'larından kaçınmak içindir.
-
-### B) Yerel (Actions kullanmadan)
-
-```powershell
-.\tools\build_release.ps1 -VersionCode 2 -VersionName 1.1.0 -Notes "hata duzeltmesi" `
-  -UpdateUrl "https://github.com/SENIN/REPO/releases/latest/download/app-release.apk"
-```
-`update.json` ve `app-release.apk` çıkar; ikisini de GitHub Release'e dosya olarak
-ekleyin. İmza doğrulaması:
-```powershell
-python tools\verify_update.py --update-json update.json
-```
-
-> **Anahtar disiplini:** `release.keystore`, `keystore.properties`,
-> `tools\update_key_private.b64` **asla** repoya eklenmez (`.gitignore`'da).
-> Bunları ayrı ve güvenli bir yerde saklayın. Özel anahtar sızdırılırsa herkes
-> sahte güncelleme imzalayabilir — kimseyle paylaşmayın.
-
----
-
-## 7) Sınırlamalar ve Dürüst Notlar
+## 6) Sınırlamalar ve Dürüst Notlar
 
 - **Abonelik yönlendirmesi (sealed sender) yapılmaz**: relay, kimin kime yazdığını
   (alıcı kodu + iki açık anahtar) görür. Bu, "mesaj içeriği + rehber" gizliliğini
@@ -210,7 +160,7 @@ python tools\verify_update.py --update-json update.json
 
 ---
 
-## 8) Uygulama Adını/Adını Değiştirme
+## 7) Uygulama Adını/Adını Değiştirme
 
 - Ad: `app/src/main/res/values/strings.xml` → `app_name`
 - Paket adı: `app/build.gradle.kts` → `applicationId` + `namespace` (tüm
@@ -219,7 +169,7 @@ python tools\verify_update.py --update-json update.json
 
 ---
 
-## 9) Doğrulama Yaptık, Gör
+## 8) Doğrulama Yaptık, Gör
 
 - Kripto çekirdeği BC ile JVM'de test edildi: X25519/HKDF/AES-GCM zararı
   dayanımı, kurcalamayı reddetme, Ed25519, Base32 — **ALL PASS**
