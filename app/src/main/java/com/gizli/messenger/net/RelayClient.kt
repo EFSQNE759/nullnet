@@ -58,9 +58,10 @@ object Wire {
 
 class RelayClient {
 
-    fun send(relay: String, envelopeJson: String): Boolean {
+    fun send(relay: String, envelopeJson: String, proxy: java.net.Proxy? = null): Boolean {
         return try {
-            val conn = URL(relay.trimEnd('/') + "/send").openConnection() as HttpURLConnection
+            val url = URL(relay.trimEnd('/') + "/send")
+            val conn = (if (proxy != null) url.openConnection(proxy) else url.openConnection()) as HttpURLConnection
             try {
                 conn.requestMethod = "POST"
                 conn.doOutput = true
@@ -77,10 +78,11 @@ class RelayClient {
         }
     }
 
-    fun pull(relay: String, userId: String): List<String> {
+    fun pull(relay: String, userId: String, proxy: java.net.Proxy? = null): List<String> {
         return try {
             val u = relay.trimEnd('/') + "/pull?u=" + URLEncoder.encode(userId, "UTF-8")
-            val conn = URL(u).openConnection() as HttpURLConnection
+            val url = URL(u)
+            val conn = (if (proxy != null) url.openConnection(proxy) else url.openConnection()) as HttpURLConnection
             try {
                 conn.requestMethod = "GET"
                 conn.connectTimeout = 15000

@@ -1,14 +1,22 @@
 package com.gizli.messenger.ui
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.media.MediaPlayer
+import android.media.MediaRecorder
 import android.net.Uri
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -44,13 +52,18 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.PhotoCamera
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Reply
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -94,7 +107,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import com.gizli.messenger.BuildConfig
 import com.gizli.messenger.data.Contact
 import com.gizli.messenger.data.Group
@@ -107,6 +122,7 @@ import com.gizli.messenger.update.UpdateManager
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -128,6 +144,7 @@ fun GizliApp() {
     val groups by Repo.groups.collectAsState()
     val settings by Repo.settings.collectAsState()
     val allMessages by Repo.messages.collectAsState()
+    val locked by Repo.locked.collectAsState()
 
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     var showCreateGroup by remember { mutableStateOf(false) }
@@ -165,6 +182,7 @@ fun GizliApp() {
         val id = identity
         when {
             id == null -> CenterLoading()
+            locked -> LockScreen()
             id.displayName.isBlank() -> Onboarding { name ->
                 Repo.setDisplayName(name)
                 if (Repo.settings.value?.backgroundPolling == true) PollService.start(context)
@@ -192,6 +210,7 @@ fun GizliApp() {
                             title = group?.name ?: contact?.name ?: "Sohbet",
                             avatarB64 = group?.avatarB64 ?: contact?.avatarB64 ?: "",
                             isGroup = group != null,
+                            chatId = chatId,
                             messages = allMessages[chatId].orEmpty(),
                             nameOf = { uid ->
                                 if (uid == Repo.identity.value?.userId) "Sen"
@@ -199,14 +218,23 @@ fun GizliApp() {
                             },
                             onBack = { screen = Screen.Home },
                             onGroupInfo = if (group != null) ({ screen = Screen.GroupInfo(chatId) }) else null,
-                            onSend = { t ->
-                                if (group != null) Repo.sendGroupMessage(chatId, t) else Repo.sendMessage(chatId, t)
+                            onSend = { t, rid, rprev ->
+                                if (group != null) Repo.sendGroupMessage(chatId, t, replyToId = rid, replyPreview = rprev)
+                                else Repo.sendMessage(chatId, t, replyToId = rid, replyPreview = rprev)
                             },
-                            onSendImage = { b64, once ->
-                                if (group != null) Repo.sendGroupMessage(chatId, b64, "image", once)
-                                else Repo.sendMessage(chatId, b64, "image", once)
+                            onSendMedia = { content, mtype, once, fname, rid, rprev ->
+                                if (group != null) Repo.sendGroupMessage(chatId, content, mtype, once, fname, rid, rprev)
+                                else Repo.sendMessage(chatId, content, mtype, once, fname, rid, rprev)
                             },
-                            onViewOnce = { mid -> Repo.markViewed(mid) }
+                            onViewOnce = { mid -> Repo.markViewed(mid) },
+                            onReact = { mid, emoji -> Repo.react(chatId, mid, emoji, group != null) },
+                            forwardTargets = buildList {
+                                contacts.forEach { add(Triple(it.userId, it.name, false)) }
+                                groups.forEach { add(Triple(it.id, it.name, true)) }
+                            },
+                            onForward = { mid, targetId, targetIsGroup ->
+                                Repo.forwardMessage(chatId, mid, targetId, targetIsGroup)
+                            }
                         )
                     }
 
@@ -471,33 +499,125 @@ private fun ChatScreen(
     title: String,
     avatarB64: String,
     isGroup: Boolean,
+    chatId: String,
     messages: List<Message>,
     nameOf: (String) -> String,
     onBack: () -> Unit,
     onGroupInfo: (() -> Unit)?,
-    onSend: (String) -> Unit,
-    onSendImage: (String, Boolean) -> Unit,
-    onViewOnce: (String) -> Unit
+    onSend: (String, String, String) -> Unit,
+    onSendMedia: (String, String, Boolean, String, String, String) -> Unit,
+    onViewOnce: (String) -> Unit,
+    onReact: (String, String) -> Unit,
+    forwardTargets: List<Triple<String, String, Boolean>>,
+    onForward: (String, String, Boolean) -> Unit
 ) {
     val context = LocalContext.current
     var text by remember { mutableStateOf("") }
-    var imageMenu by remember { mutableStateOf(false) }
+    var attachMenu by remember { mutableStateOf(false) }
     var pendingOnce by remember { mutableStateOf(false) }
     var viewing by remember { mutableStateOf<Message?>(null) }
     var pendingDownload by remember { mutableStateOf<String?>(null) }
+    var pendingDownloadName by remember { mutableStateOf("dosya") }
+    var pendingDownloadMime by remember { mutableStateOf("application/octet-stream") }
+    var replyTo by remember { mutableStateOf<Message?>(null) }
+    var menuMsg by remember { mutableStateOf<Message?>(null) }
+    var forwardMsg by remember { mutableStateOf<Message?>(null) }
+    var recording by remember { mutableStateOf(false) }
+    var recordSecs by remember { mutableStateOf(0) }
+    var recorder by remember { mutableStateOf<MediaRecorder?>(null) }
+    var recordFile by remember { mutableStateOf<File?>(null) }
     val listState = rememberLazyListState()
+
+    val typingSet by Repo.typing.collectAsState()
+    val groupMemberIds = remember(chatId, isGroup) {
+        if (isGroup) Repo.groupById(chatId)?.members?.map { it.userId }?.toSet() ?: emptySet() else emptySet()
+    }
+    val typingNames = typingSet
+        .filter { it != Repo.identity.value?.userId && (if (isGroup) groupMemberIds.contains(it) else it == chatId) }
+        .map { nameOf(it) }
+    val typingText = when {
+        typingNames.size == 1 -> "${typingNames[0]} yazıyor…"
+        typingNames.size > 1 -> "birkaç kişi yazıyor…"
+        else -> null
+    }
+
+    LaunchedEffect(chatId) { Repo.markChatRead(chatId, isGroup) }
+    LaunchedEffect(messages.size) { if (messages.isNotEmpty()) Repo.markChatRead(chatId, isGroup) }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
             val b64 = compressImageToBase64(context, uri)
-            if (b64 != null) onSendImage(b64, pendingOnce)
-            pendingOnce = false
+            if (b64 != null) {
+                val r = replyTo
+                onSendMedia(b64, "image", pendingOnce, "", r?.id ?: "", r?.let { previewOf(it) } ?: "")
+            }
+            pendingOnce = false; replyTo = null
         }
     }
-    val downloader = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/jpeg")) { uri ->
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            val res = readUriBytes(context, uri, 1_000_000)
+            if (res == null) Toast.makeText(context, "Dosya çok büyük (üst sınır ~1 MB).", Toast.LENGTH_LONG).show()
+            else {
+                val b64 = android.util.Base64.encodeToString(res.first, android.util.Base64.NO_WRAP)
+                val r = replyTo
+                onSendMedia(b64, "file", false, res.second, r?.id ?: "", r?.let { previewOf(it) } ?: "")
+                replyTo = null
+            }
+        }
+    }
+    val downloader = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument(pendingDownloadMime)) { uri ->
         val data = pendingDownload
         if (uri != null && data != null) saveBase64ToUri(context, uri, data)
         pendingDownload = null
+    }
+    val micPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) Toast.makeText(context, "Ses kaydı için tekrar dokun.", Toast.LENGTH_SHORT).show()
+        else Toast.makeText(context, "Mikrofon izni gerekli.", Toast.LENGTH_LONG).show()
+    }
+
+    fun startRecording() {
+        try {
+            val f = File(context.cacheDir, "rec_${System.currentTimeMillis()}.m4a")
+            val rec = if (android.os.Build.VERSION.SDK_INT >= 31) MediaRecorder(context) else @Suppress("DEPRECATION") MediaRecorder()
+            rec.setAudioSource(MediaRecorder.AudioSource.MIC)
+            rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+            rec.setAudioSamplingRate(16000)
+            rec.setAudioEncodingBitRate(24000)
+            rec.setOutputFile(f.absolutePath)
+            rec.prepare(); rec.start()
+            recorder = rec; recordFile = f; recording = true; recordSecs = 0
+        } catch (e: Exception) {
+            Toast.makeText(context, "Kayıt başlatılamadı: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun stopRecording(send: Boolean) {
+        val rec = recorder ?: return
+        val f = recordFile
+        recording = false
+        try { rec.stop() } catch (_: Exception) { }
+        try { rec.release() } catch (_: Exception) { }
+        recorder = null
+        if (!send) { f?.delete(); return }
+        if (f != null && f.exists()) {
+            val bytes = f.readBytes()
+            if (bytes.size > 800_000) Toast.makeText(context, "Kayıt çok uzun.", Toast.LENGTH_LONG).show()
+            else {
+                val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                val r = replyTo
+                onSendMedia(b64, "audio", false, "", r?.id ?: "", r?.let { previewOf(it) } ?: "")
+                replyTo = null
+            }
+            f.delete()
+        }
+    }
+
+    LaunchedEffect(recording) {
+        if (recording) {
+            while (recording) { delay(1000); recordSecs += 1; if (recordSecs >= 60) stopRecording(true) }
+        }
     }
 
     LaunchedEffect(messages.size) {
@@ -510,7 +630,10 @@ private fun ChatScreen(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         AvatarB64(b64 = avatarB64, fallback = title.take(1).uppercase(), size = 34.dp)
                         Spacer(Modifier.width(10.dp))
-                        Text(title)
+                        Column {
+                            Text(title)
+                            if (typingText != null) Text(typingText, fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
+                        }
                     }
                 },
                 navigationIcon = {
@@ -535,43 +658,90 @@ private fun ChatScreen(
                     MessageBubble(
                         m = m,
                         senderName = if (isGroup && !m.outgoing) nameOf(m.senderId) else null,
-                        onOpenImage = { viewing = m }
+                        nameById = nameOf,
+                        onOpenImage = { viewing = m },
+                        onLongPress = { menuMsg = m }
                     )
                 }
             }
-            Row(
-                Modifier.fillMaxWidth().navigationBarsPadding().padding(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box {
-                    IconButton(onClick = { imageMenu = true }) {
-                        Icon(Icons.Filled.Image, "Fotoğraf", tint = MaterialTheme.colorScheme.primary)
+
+            if (replyTo != null) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Yanıtlanıyor", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
+                        Text(previewOf(replyTo!!), fontSize = 12.sp, maxLines = 1, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    DropdownMenu(expanded = imageMenu, onDismissRequest = { imageMenu = false }) {
-                        DropdownMenuItem(
-                            text = { Text("Fotoğraf gönder") },
-                            leadingIcon = { Icon(Icons.Filled.Image, null) },
-                            onClick = { imageMenu = false; pendingOnce = false; picker.launch("image/*") }
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Tek seferlik fotoğraf") },
-                            leadingIcon = { Icon(Icons.Filled.Lock, null) },
-                            onClick = { imageMenu = false; pendingOnce = true; picker.launch("image/*") }
-                        )
+                    IconButton(onClick = { replyTo = null }) { Icon(Icons.Filled.Close, "Vazgeç") }
+                }
+            }
+
+            if (recording) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("● Kayıt", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.width(10.dp))
+                    Text(formatDuration(recordSecs))
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = { stopRecording(false) }) { Text("Vazgeç") }
+                    TextButton(onClick = { stopRecording(true) }) { Text("Gönder") }
+                }
+            } else {
+                Row(
+                    Modifier.fillMaxWidth().navigationBarsPadding().padding(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box {
+                        IconButton(onClick = { attachMenu = true }) {
+                            Icon(Icons.Filled.AttachFile, "Ekle", tint = MaterialTheme.colorScheme.primary)
+                        }
+                        DropdownMenu(expanded = attachMenu, onDismissRequest = { attachMenu = false }) {
+                            DropdownMenuItem(
+                                text = { Text("Fotoğraf gönder") },
+                                leadingIcon = { Icon(Icons.Filled.Image, null) },
+                                onClick = { attachMenu = false; pendingOnce = false; picker.launch("image/*") }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Tek seferlik fotoğraf") },
+                                leadingIcon = { Icon(Icons.Filled.Lock, null) },
+                                onClick = { attachMenu = false; pendingOnce = true; picker.launch("image/*") }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Dosya paylaş") },
+                                leadingIcon = { Icon(Icons.Filled.AttachFile, null) },
+                                onClick = { attachMenu = false; filePicker.launch(arrayOf("*/*")) }
+                            )
+                        }
+                    }
+                    OutlinedTextField(
+                        value = text,
+                        onValueChange = { text = it; if (it.isNotBlank()) Repo.sendTyping(chatId, isGroup) },
+                        modifier = Modifier.weight(1f),
+                        placeholder = { Text("Mesaj yaz…") },
+                        maxLines = 5
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    if (text.isNotBlank()) {
+                        IconButton(onClick = {
+                            val r = replyTo
+                            onSend(text.trim(), r?.id ?: "", r?.let { previewOf(it) } ?: "")
+                            text = ""; replyTo = null
+                        }) { Icon(Icons.Filled.Send, "Gönder", tint = MaterialTheme.colorScheme.primary) }
+                    } else {
+                        IconButton(
+                            onClick = {
+                                if (androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+                                    == android.content.pm.PackageManager.PERMISSION_GRANTED
+                                ) startRecording()
+                                else micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                            }
+                        ) { Icon(Icons.Filled.Mic, "Sesli mesaj", tint = MaterialTheme.colorScheme.primary) }
                     }
                 }
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Mesaj yaz…") },
-                    maxLines = 5
-                )
-                Spacer(Modifier.width(8.dp))
-                IconButton(
-                    onClick = { if (text.isNotBlank()) { onSend(text.trim()); text = "" } },
-                    enabled = text.isNotBlank()
-                ) { Icon(Icons.Filled.Send, "Gönder", tint = MaterialTheme.colorScheme.primary) }
             }
         }
     }
@@ -584,15 +754,114 @@ private fun ChatScreen(
                 viewing = null
             },
             onDownload = if (!msg.viewOnce && msg.text.isNotBlank()) ({
-                pendingDownload = msg.text
+                pendingDownload = msg.text; pendingDownloadMime = "image/jpeg"
                 downloader.launch("nullnet_" + msg.id.take(8) + ".jpg")
             }) else null
+        )
+    }
+
+    menuMsg?.let { m ->
+        MessageActionsDialog(
+            outgoing = m.outgoing,
+            onReply = { replyTo = m; menuMsg = null },
+            onReact = { e -> onReact(m.id, e); menuMsg = null },
+            onCopy = {
+                if (m.type == "text") {
+                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("mesaj", m.text))
+                }
+                menuMsg = null
+            },
+            onForward = { forwardMsg = m; menuMsg = null },
+            onDismiss = { menuMsg = null }
+        )
+    }
+
+    forwardMsg?.let { m ->
+        ForwardDialog(
+            targets = forwardTargets,
+            onPick = { id, isGrp -> onForward(m.id, id, isGrp); forwardMsg = null },
+            onDismiss = { forwardMsg = null }
         )
     }
 }
 
 @Composable
-private fun MessageBubble(m: Message, senderName: String?, onOpenImage: () -> Unit) {
+private fun MessageActionsDialog(
+    outgoing: Boolean,
+    onReply: () -> Unit,
+    onReact: (String) -> Unit,
+    onCopy: () -> Unit,
+    onForward: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val emojis = listOf("👍", "❤️", "😂", "😮", "😢", "🙏")
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface) {
+            Column(Modifier.padding(12.dp)) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                    emojis.forEach { e ->
+                        Text(e, fontSize = 26.sp, modifier = Modifier.clickable { onReact(e) }.padding(4.dp))
+                    }
+                }
+                HorizontalDivider(Modifier.padding(vertical = 6.dp))
+                TextButton(onClick = onReply, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.Reply, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("Yanıtla")
+                }
+                TextButton(onClick = onForward, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.Share, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("İlet")
+                }
+                if (!outgoing) {
+                    TextButton(onClick = onCopy, modifier = Modifier.fillMaxWidth()) {
+                        Icon(Icons.Filled.ContentCopy, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("Kopyala")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ForwardDialog(
+    targets: List<Triple<String, String, Boolean>>,
+    onPick: (String, Boolean) -> Unit,
+    onDismiss: () -> Unit
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surface) {
+            Column(Modifier.padding(16.dp)) {
+                Text("İlet", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Spacer(Modifier.height(8.dp))
+                if (targets.isEmpty()) {
+                    Text("İletilecek sohbet yok.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                        targets.forEach { (id, name, isGrp) ->
+                            Row(
+                                Modifier.fillMaxWidth().clickable { onPick(id, isGrp) }.padding(vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (isGrp) { Icon(Icons.Filled.Group, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)) }
+                                Text(name)
+                            }
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun MessageBubble(
+    m: Message,
+    senderName: String?,
+    nameById: (String) -> String,
+    onOpenImage: () -> Unit,
+    onLongPress: () -> Unit
+) {
     val isOut = m.outgoing
     val bubbleColor = if (isOut) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
     else MaterialTheme.colorScheme.surfaceVariant
@@ -608,27 +877,67 @@ private fun MessageBubble(m: Message, senderName: String?, onOpenImage: () -> Un
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
                 )
             }
-            Surface(color = bubbleColor, shape = RoundedCornerShape(14.dp)) {
-                when {
-                    m.type == "image" && m.viewOnce -> {
-                        val label = when {
-                            m.text.isNotBlank() && !isOut -> "Tek seferlik fotoğraf · açmak için dokun"
-                            isOut && m.text.isNotBlank() -> "Tek seferlik fotoğraf · gönderiliyor"
-                            isOut -> "Tek seferlik fotoğraf gönderildi"
-                            else -> "Tek seferlik fotoğraf görüntülendi"
-                        }
+            Surface(
+                color = bubbleColor,
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.combinedClickable(onClick = {}, onLongClick = onLongPress)
+            ) {
+                Column {
+                    if (m.replyPreview.isNotBlank()) {
                         Row(
-                            Modifier.clickable(enabled = m.text.isNotBlank()) { onOpenImage() }
-                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 6.dp)
+                                .background(
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
+                                    RoundedCornerShape(8.dp)
+                                ).padding(6.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(Icons.Filled.Lock, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                            Icon(Icons.Filled.Reply, null, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.primary)
                             Spacer(Modifier.width(6.dp))
-                            Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(m.replyPreview, fontSize = 12.sp, maxLines = 2, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
-                    m.type == "image" -> ImageBubble(m.text, onClick = onOpenImage)
-                    else -> Text(m.text, Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+                    when {
+                        m.type == "image" && m.viewOnce -> {
+                            val label = when {
+                                m.text.isNotBlank() && !isOut -> "Tek seferlik fotoğraf · açmak için dokun"
+                                isOut && m.text.isNotBlank() -> "Tek seferlik fotoğraf · gönderiliyor"
+                                isOut -> "Tek seferlik fotoğraf gönderildi"
+                                else -> "Tek seferlik fotoğraf görüntülendi"
+                            }
+                            Row(
+                                Modifier.clickable(enabled = m.text.isNotBlank()) { onOpenImage() }
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(Icons.Filled.Lock, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                                Spacer(Modifier.width(6.dp))
+                                Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
+                        m.type == "image" -> ImageBubble(m.text, onClick = onOpenImage)
+                        m.type == "audio" -> AudioBubble(b64 = m.text, outgoing = isOut)
+                        m.type == "file" -> FileBubble(name = m.fileName.ifBlank { "dosya" }, b64 = m.text, sizeHint = m.text.length)
+                        else -> Text(m.text, Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+                    }
+                    if (m.reactions.isNotEmpty()) {
+                        Row(Modifier.padding(horizontal = 8.dp, vertical = 2.dp)) {
+                            val grouped = m.reactions.values.groupingBy { it }.eachCount()
+                            grouped.forEach { (emoji, count) ->
+                                Surface(
+                                    color = MaterialTheme.colorScheme.surface,
+                                    shape = RoundedCornerShape(10.dp),
+                                    modifier = Modifier.padding(end = 4.dp)
+                                ) {
+                                    Text(
+                                        emoji + if (count > 1) " $count" else "",
+                                        fontSize = 12.sp,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Text(
@@ -638,6 +947,54 @@ private fun MessageBubble(m: Message, senderName: String?, onOpenImage: () -> Un
                 modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
             )
         }
+    }
+}
+
+@Composable
+private fun AudioBubble(b64: String, outgoing: Boolean) {
+    val context = LocalContext.current
+    var playing by remember { mutableStateOf(false) }
+    var player by remember { mutableStateOf<MediaPlayer?>(null) }
+    Row(Modifier.padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        IconButton(onClick = {
+            if (playing) {
+                player?.release(); player = null; playing = false
+            } else {
+                val tmp = File(context.cacheDir, "play_${System.currentTimeMillis()}.m4a")
+                tmp.writeBytes(android.util.Base64.decode(b64, android.util.Base64.DEFAULT))
+                val mp = MediaPlayer()
+                mp.setDataSource(tmp.absolutePath)
+                mp.setOnCompletionListener { playing = false; it.release(); player = null; tmp.delete() }
+                mp.prepare(); mp.start()
+                player = mp; playing = true
+            }
+        }) {
+            Icon(if (playing) Icons.Filled.Stop else Icons.Filled.PlayArrow, "Sesli mesaj", tint = MaterialTheme.colorScheme.primary)
+        }
+        Text("Sesli mesaj", color = MaterialTheme.colorScheme.onSurface)
+    }
+}
+
+@Composable
+private fun FileBubble(name: String, b64: String, sizeHint: Int) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    Row(
+        Modifier.padding(horizontal = 12.dp, vertical = 8.dp).widthIn(max = 260.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.Filled.AttachFile, null, tint = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.width(8.dp))
+        Column(Modifier.weight(1f)) {
+            Text(name, maxLines = 2, fontSize = 14.sp)
+            Text("~${sizeHint / 1365 + 1} KB", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.width(6.dp))
+        IconButton(onClick = {
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("dosya", b64))
+            Toast.makeText(context, "Dosya panoya kopyalandı.", Toast.LENGTH_SHORT).show()
+        }) { Icon(Icons.Filled.Download, "Kopyala", tint = MaterialTheme.colorScheme.primary) }
     }
 }
 
@@ -662,40 +1019,104 @@ private fun ImageBubble(b64: String, onClick: () -> Unit) {
 
 @Composable
 private fun ImageViewer(message: Message, onClose: () -> Unit, onDownload: (() -> Unit)?) {
-    Dialog(onDismissRequest = onClose) {
-        Column(
-            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            val bmp = remember(message.text) { decodeB64Bitmap(message.text) }
+    val bmp = remember(message.text) { decodeB64Bitmap(message.text) }
+    var scale by remember { mutableStateOf(1f) }
+    var offsetX by remember { mutableStateOf(0f) }
+    var offsetY by remember { mutableStateOf(0f) }
+    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
+        scale = (scale * zoomChange).coerceIn(1f, 6f)
+        offsetX += panChange.x
+        offsetY += panChange.y
+    }
+    Dialog(
+        onDismissRequest = onClose,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
             if (bmp != null) {
                 Image(
                     bitmap = bmp.asImageBitmap(),
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp)
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer(
+                            scaleX = scale, scaleY = scale,
+                            translationX = offsetX, translationY = offsetY
+                        )
+                        .transformable(transformState)
                 )
             } else {
-                Text("İçerik yok", color = Color.White)
+                Text("İçerik yok", color = Color.White, modifier = Modifier.align(Alignment.Center))
             }
-            Spacer(Modifier.height(12.dp))
-            Row {
-                if (onDownload != null) {
-                    Button(onClick = onDownload) {
-                        Icon(Icons.Filled.Download, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp))
-                        Text("İndir")
+
+            Row(
+                Modifier.fillMaxWidth().padding(8.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(onClick = onClose) { Icon(Icons.Filled.Close, "Kapat", tint = Color.White) }
+                Row {
+                    if (scale > 1.05f) {
+                        IconButton(onClick = { scale = 1f; offsetX = 0f; offsetY = 0f }) {
+                            Icon(Icons.Filled.Refresh, "Sığdır", tint = Color.White)
+                        }
                     }
-                    Spacer(Modifier.width(10.dp))
-                }
-                OutlinedButton(onClick = onClose) {
-                    if (message.viewOnce && message.text.isNotBlank()) {
-                        Icon(Icons.Filled.Lock, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp))
-                        Text("Kapat (tek seferlik)")
-                    } else {
-                        Text("Kapat")
+                    if (onDownload != null) {
+                        IconButton(onClick = onDownload) { Icon(Icons.Filled.Download, "İndir", tint = Color.White) }
                     }
                 }
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LockScreen() {
+    var pin by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    Scaffold { pad ->
+        Column(
+            Modifier.fillMaxSize().padding(pad).padding(24.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(Icons.Filled.Lock, null, Modifier.size(56.dp), tint = MaterialTheme.colorScheme.primary)
+            Spacer(Modifier.height(16.dp))
+            Text("nullnet kilitli", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
+            Text("Devam etmek için PIN gir", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(20.dp))
+            OutlinedTextField(
+                value = pin,
+                onValueChange = { new -> pin = new.filter { it.isDigit() }.take(12); error = false },
+                label = { Text("PIN") },
+                singleLine = true,
+                isError = error,
+                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                    keyboardType = androidx.compose.ui.text.input.KeyboardType.NumberPassword
+                ),
+                modifier = Modifier.fillMaxWidth()
+            )
+            if (error) {
+                Spacer(Modifier.height(6.dp))
+                Text("Yanlış PIN.", color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+            }
+            Spacer(Modifier.height(16.dp))
+            Button(
+                onClick = {
+                    when (Repo.verifyPin(pin)) {
+                        "ok" -> Repo.unlock()
+                        "duress" -> { Repo.wipeAll() }
+                        else -> { error = true; pin = "" }
+                    }
+                },
+                enabled = pin.length >= 4,
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Aç") }
         }
     }
 }
@@ -748,10 +1169,47 @@ private fun compressAvatarToBase64(context: Context, uri: Uri): String? {
     }
 }
 
-private fun statusSuffix(m: Message): String = when (m.status) {
-    MessageStatus.PENDING -> " · gönderiliyor"
-    MessageStatus.FAILED -> " · gönderilemedi"
-    else -> ""
+private fun statusSuffix(m: Message): String {
+    if (!m.outgoing) return ""
+    return when (m.status) {
+        MessageStatus.PENDING -> " · gönderiliyor"
+        MessageStatus.SENT -> " · gönderildi"
+        MessageStatus.DELIVERED -> " · iletildi"
+        MessageStatus.READ -> " · okundu"
+        MessageStatus.FAILED -> " · gönderilemedi"
+    }
+}
+
+private fun previewOf(m: Message): String = when (m.type) {
+    "image" -> "📷 Fotoğraf"
+    "audio" -> "🎤 Sesli mesaj"
+    "file" -> "📎 " + m.fileName.ifBlank { "Dosya" }
+    else -> m.text
+}
+
+private fun formatDuration(secs: Int): String =
+    "%d:%02d".format(secs / 60, secs % 60)
+
+/** Uri'den en fazla maxBytes okuyup (bytes, dosyaAdı) döndürür; aşılırsa null. */
+private fun readUriBytes(context: Context, uri: Uri, maxBytes: Int): Pair<ByteArray, String>? {
+    return try {
+        val name = queryDisplayName(context, uri) ?: "dosya"
+        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+        if (bytes.size > maxBytes) null else bytes to name
+    } catch (e: Exception) {
+        null
+    }
+}
+
+private fun queryDisplayName(context: Context, uri: Uri): String? {
+    return try {
+        context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+        }
+    } catch (e: Exception) {
+        null
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -844,11 +1302,39 @@ private fun SettingsScreen(onBack: () -> Unit, onWiped: () -> Unit) {
     var mqttPort by remember { mutableStateOf((settings?.mqttPort ?: 8883).toString()) }
     var mqttTls by remember { mutableStateOf(settings?.mqttTls ?: true) }
     var confirmWipe by remember { mutableStateOf(false) }
+    var useTor by remember { mutableStateOf(settings?.useTor ?: false) }
+    var torHost by remember { mutableStateOf(settings?.torHost ?: "127.0.0.1") }
+    var torPort by remember { mutableStateOf((settings?.torPort ?: 9050).toString()) }
+    var lockPin by remember { mutableStateOf("") }
+    var lockDuress by remember { mutableStateOf("") }
+    var lockCurrent by remember { mutableStateOf("") }
+    var lockMsg by remember { mutableStateOf<String?>(null) }
+    var backupPw by remember { mutableStateOf("") }
+    var backupMsg by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
 
     val avatarPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
             val b64 = compressAvatarToBase64(context, uri)
             if (b64 != null) avatar = b64
+        }
+    }
+    val backupSaver = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")) { uri ->
+        if (uri != null) {
+            runCatching {
+                val bytes = Repo.exportBackup(backupPw)
+                context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                backupMsg = "Yedek kaydedildi (${bytes.size / 1024} KB)."
+            }.onFailure { backupMsg = "Hata: ${it.message}" }
+        }
+    }
+    val backupOpener = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            runCatching {
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: throw Exception("Okunamadı")
+                Repo.importBackup(bytes, backupPw)
+            }.onSuccess { backupMsg = "Yedek geri yüklendi." }
+                .onFailure { backupMsg = "Hata: ${it.message}" }
         }
     }
 
@@ -935,6 +1421,109 @@ private fun SettingsScreen(onBack: () -> Unit, onWiped: () -> Unit) {
             }
 
             Spacer(Modifier.height(24.dp))
+            Text("Uygulama kilidi", fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                if (settings?.lockEnabled == true) "Kilit açık. Uygulama arka plana atıldıktan sonra PIN ister."
+                else "Açıkken uygulama PIN (veya biyometrik) ister. Zorlama PIN'i girilirse tüm veriler silinir.",
+                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = lockPin, onValueChange = { lockPin = it.filter { c -> c.isDigit() }.take(12) },
+                label = { Text(if (settings?.lockEnabled == true) "Yeni PIN (boş = değiştirme)" else "PIN") },
+                singleLine = true, modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = lockDuress, onValueChange = { lockDuress = it.filter { c -> c.isDigit() }.take(12) },
+                label = { Text("Zorlama (duress) PIN — isteğe bağlı") },
+                singleLine = true, modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            Row {
+                Button(
+                    onClick = {
+                        if (lockPin.length >= 4) {
+                            Repo.setLock(lockPin, lockDuress.ifBlank { null })
+                            lockPin = ""; lockDuress = ""; lockMsg = "Kilit ayarlandı."
+                        } else lockMsg = "PIN en az 4 haneli olmalı."
+                    },
+                    enabled = lockPin.length >= 4,
+                    modifier = Modifier.weight(1f)
+                ) { Text(if (settings?.lockEnabled == true) "Kilidi güncelle" else "Kilidi aç") }
+                if (settings?.lockEnabled == true) {
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedButton(onClick = {
+                        if (Repo.verifyPin(lockCurrent) == "ok") { Repo.setLock(null, null); lockCurrent = ""; lockMsg = "Kilit kaldırıldı." }
+                        else lockMsg = "Kaldırmak için mevcut PIN'i gir."
+                    }, modifier = Modifier.weight(1f)) { Text("Kilidi kaldır") }
+                }
+            }
+            if (settings?.lockEnabled == true) {
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = lockCurrent, onValueChange = { lockCurrent = it.filter { c -> c.isDigit() } },
+                    label = { Text("Mevcut PIN (kaldırmak için)") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+                )
+            }
+            lockMsg?.let { Text(it, color = MaterialTheme.colorScheme.primary, fontSize = 13.sp) }
+
+            Spacer(Modifier.height(24.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Tor üzerinden bağlan", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Mesajlar Orbot (SOCKS5) üzerinden Tor ağına taşınır. Orbot kurulu ve açık olmalı.",
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(checked = useTor, onCheckedChange = { useTor = it })
+            }
+            if (useTor) {
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = torHost, onValueChange = { torHost = it }, label = { Text("SOCKS host") },
+                        singleLine = true, modifier = Modifier.weight(1f)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(
+                        value = torPort, onValueChange = { new -> torPort = new.filter { it.isDigit() } }, label = { Text("Port") },
+                        singleLine = true, modifier = Modifier.width(110.dp)
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+            Text("Şifreli yedek", fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Tüm mesajların ve kimliğin parola ile şifrelenip tek dosyaya yazılır. Parolayı unutma!",
+                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = backupPw, onValueChange = { backupPw = it },
+                label = { Text("Yedek parolası") }, singleLine = true,
+                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            Row {
+                Button(
+                    onClick = { backupSaver.launch("nullnet_yedek.ngbk") },
+                    enabled = backupPw.length >= 4, modifier = Modifier.weight(1f)
+                ) { Text("Yedek al") }
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(
+                    onClick = { backupOpener.launch(arrayOf("*/*")) },
+                    enabled = backupPw.length >= 4, modifier = Modifier.weight(1f)
+                ) { Text("Geri yükle") }
+            }
+            backupMsg?.let { Spacer(Modifier.height(6.dp)); Text(it, color = MaterialTheme.colorScheme.primary, fontSize = 13.sp) }
+
+            Spacer(Modifier.height(24.dp))
             Text("Aktarma yöntemi", fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
             Row {
@@ -992,6 +1581,7 @@ private fun SettingsScreen(onBack: () -> Unit, onWiped: () -> Unit) {
                 if (name.isNotBlank()) Repo.setDisplayName(name.trim())
                 if (relay.isNotBlank()) Repo.setRelay(relay.trim())
                 Repo.setMqtt(mqttHost.trim().ifBlank { "broker.hivemq.com" }, mqttPort.toIntOrNull() ?: 8883, mqttTls)
+                Repo.setTor(useTor, torHost.trim().ifBlank { "127.0.0.1" }, torPort.toIntOrNull() ?: 9050)
                 Repo.setTransport(transport)
                 Repo.disconnectMqtt()
                 if (transport == "mqtt") Repo.connectMqtt()

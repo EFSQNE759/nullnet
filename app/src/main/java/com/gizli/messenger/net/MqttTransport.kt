@@ -26,10 +26,16 @@ class MqttTransport(
     clientId: String,
     private val topic: String,
     private val onMessage: (String) -> Unit,
-    private val onConnected: () -> Unit = {}
+    private val onConnected: () -> Unit = {},
+    torHost: String? = null,
+    torPort: Int = 9050
 ) {
     private val uri = (if (tls) "ssl://" else "tcp://") + host + ":" + port
     private val client = MqttAsyncClient(uri, clientId, MemoryPersistence())
+    private val socketFactory: javax.net.SocketFactory? =
+        if (torHost != null) {
+            if (tls) Socks.Tls(torHost, torPort) else Socks.Plain(torHost, torPort)
+        } else null
 
     @Volatile
     private var started = false
@@ -60,9 +66,10 @@ class MqttTransport(
             val opts = MqttConnectOptions().apply {
                 isAutomaticReconnect = true
                 isCleanSession = false
-                connectionTimeout = 15
+                connectionTimeout = 20
                 keepAliveInterval = 30
                 maxInflight = 100
+                socketFactory?.let { setSocketFactory(it) }
             }
             client.connect(opts, null, object : IMqttActionListener {
                 override fun onSuccess(asyncActionToken: IMqttToken?) = subscribe()

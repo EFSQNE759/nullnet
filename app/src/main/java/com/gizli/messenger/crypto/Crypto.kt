@@ -81,6 +81,15 @@ object Crypto {
         return cipher.doFinal(ciphertext)
     }
 
+    // ---------- Parola tabanlı anahtar (yedek) ----------
+
+    /** PBKDF2-HMAC-SHA256 ile paroladan 32 baytlık anahtar türetir. */
+    fun deriveKey(password: String, salt: ByteArray, iterations: Int = 120_000): ByteArray {
+        val spec = javax.crypto.spec.PBEKeySpec(password.toCharArray(), salt, iterations, 256)
+        val factory = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+        return factory.generateSecret(spec).encoded
+    }
+
     // ---------- Ed25519 (güncelleme imzası doğrulama) ----------
 
     fun ed25519Verify(publicKey: ByteArray, message: ByteArray, signature: ByteArray): Boolean {

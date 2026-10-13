@@ -46,6 +46,8 @@ object Repo {
     private val _messages = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
     private val _groups = MutableStateFlow<List<Group>>(emptyList())
     private val _settings = MutableStateFlow<Settings?>(null)
+    private val _typing = MutableStateFlow<Set<String>>(emptySet())
+    private val _locked = MutableStateFlow(false)
 
     val ready: StateFlow<Boolean> = _ready
     val identity: StateFlow<Identity?> = _identity
@@ -53,6 +55,11 @@ object Repo {
     val messages: StateFlow<Map<String, List<Message>>> = _messages
     val groups: StateFlow<List<Group>> = _groups
     val settings: StateFlow<Settings?> = _settings
+    val typing: StateFlow<Set<String>> = _typing
+    val locked: StateFlow<Boolean> = _locked
+
+    private val typingJobs = HashMap<String, kotlinx.coroutines.Job>()
+    private val lastTypingSent = HashMap<String, Long>()
 
     private val idFile get() = File(ctx.filesDir, "identity.json.enc")
     private val contactsFile get() = File(ctx.filesDir, "contacts.json.enc")
@@ -70,6 +77,7 @@ object Repo {
         _groups.value = SecureStore.readSecureString(groupsFile)?.let(::parseGroups) ?: emptyList()
         persistIdentity()
         persistSettings()
+        if (_settings.value?.lockEnabled == true) _locked.value = true
         _ready.value = true
     }
 
@@ -184,6 +192,60 @@ object Repo {
         persistSettings()
     }
 
+    fun setTor(enabled: Boolean, host: String = "127.0.0.1", port: Int = 9050) {
+        _settings.value = _settings.value!!.copy(useTor = enabled, torHost = host.trim(), torPort = port)
+        persistSettings()
+    }
+
+    private fun proxyOrNull(): java.net.Proxy? {
+        val s = _settings.value ?: return null
+        return if (s.useTor) com.gizli.messenger.net.Socks.proxy(s.torHost.ifBlank { "127.0.0.1" }, s.torPort) else null
+    }
+
+    // ---------------- Uygulama kilidi ----------------
+
+    private fun hashPin(pin: String, salt: String): String {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        val d = md.digest((salt + ":" + pin).toByteArray(Charsets.UTF_8))
+        return B64.enc(d)
+    }
+
+    /** pin=null ise kilidi kapatır. duressPin verilirse zorlama (duress) PIN'i de ayarlanır. */
+    fun setLock(pin: String?, duressPin: String?) {
+        val cur = _settings.value ?: return
+        if (pin == null) {
+            _settings.value = cur.copy(lockEnabled = false, pinHash = "", pinSalt = "", duressHash = "", duressSalt = "")
+        } else {
+            val salt = B64.enc(Crypto.randomBytes(16))
+            val dSalt = B64.enc(Crypto.randomBytes(16))
+            _settings.value = cur.copy(
+                lockEnabled = true,
+                pinSalt = salt,
+                pinHash = hashPin(pin, salt),
+                duressSalt = dSalt,
+                duressHash = if (duressPin.isNullOrBlank()) "" else hashPin(duressPin, dSalt)
+            )
+        }
+        persistSettings()
+    }
+
+    /** "ok", "duress" veya "wrong" döndürür. */
+    fun verifyPin(pin: String): String {
+        val s = _settings.value ?: return "wrong"
+        if (!s.lockEnabled) return "ok"
+        if (s.pinHash.isNotEmpty() && hashPin(pin, s.pinSalt) == s.pinHash) return "ok"
+        if (s.duressHash.isNotEmpty() && hashPin(pin, s.duressSalt) == s.duressHash) return "duress"
+        return "wrong"
+    }
+
+    fun lock() {
+        if (_settings.value?.lockEnabled == true) _locked.value = true
+    }
+
+    fun unlock() {
+        _locked.value = false
+    }
+
     private fun persistSettings() {
         val s = _settings.value ?: return
         val o = JSONObject()
@@ -196,6 +258,14 @@ object Repo {
             .put("mqttTls", s.mqttTls)
             .put("theme", s.theme)
             .put("secureScreen", s.secureScreen)
+            .put("useTor", s.useTor)
+            .put("torHost", s.torHost)
+            .put("torPort", s.torPort)
+            .put("lockEnabled", s.lockEnabled)
+            .put("pinHash", s.pinHash)
+            .put("pinSalt", s.pinSalt)
+            .put("duressHash", s.duressHash)
+            .put("duressSalt", s.duressSalt)
         SecureStore.writeSecureString(settingsFile, o.toString())
     }
 
@@ -210,7 +280,15 @@ object Repo {
             o.optInt("mqttPort", 8883),
             o.optBoolean("mqttTls", true),
             o.optString("theme", "default"),
-            o.optBoolean("secureScreen", true)
+            o.optBoolean("secureScreen", true),
+            o.optBoolean("useTor", false),
+            o.optString("torHost", "127.0.0.1"),
+            o.optInt("torPort", 9050),
+            o.optBoolean("lockEnabled", false),
+            o.optString("pinHash", ""),
+            o.optString("pinSalt", ""),
+            o.optString("duressHash", ""),
+            o.optString("duressSalt", "")
         )
     }
 
@@ -460,13 +538,24 @@ object Repo {
         persistGroups(); persistMessages()
     }
 
-    fun sendGroupMessage(groupId: String, content: String, type: String = "text", viewOnce: Boolean = false) {
+    fun sendGroupMessage(
+        groupId: String,
+        content: String,
+        type: String = "text",
+        viewOnce: Boolean = false,
+        fileName: String = "",
+        replyToId: String = "",
+        replyPreview: String = ""
+    ) {
         val group = groupById(groupId) ?: return
         if (content.isBlank()) return
         val me = _identity.value!!
         val msgId = UUID.randomUUID().toString()
         val ts = System.currentTimeMillis()
-        appendMessage(Message(msgId, groupId, true, content, ts, MessageStatus.PENDING, type, groupId, me.userId, viewOnce, false))
+        appendMessage(
+            Message(msgId, groupId, true, content, ts, MessageStatus.PENDING, type, groupId, me.userId, viewOnce, false,
+                fileName, replyToId, replyPreview)
+        )
         scope.launch {
             val inner = JSONObject()
                 .put("type", "group_msg")
@@ -476,6 +565,9 @@ object Repo {
                 .put("gname", group.name)
                 .put("mtype", type)
                 .put("once", viewOnce)
+                .put("file", fileName)
+                .put("rid", replyToId)
+                .put("rprev", replyPreview)
                 .put("body", content)
                 .put("ts", ts)
                 .put("id", msgId)
@@ -491,6 +583,53 @@ object Repo {
         }
     }
 
+    // ---------------- Şifreli yedek ----------------
+
+    private val BACKUP_MAGIC = "NGBK1".toByteArray(Charsets.US_ASCII)
+
+    /** Tüm verileri (kimlik dahil) parola ile şifreleyip yedek üretir. */
+    fun exportBackup(password: String): ByteArray {
+        val root = JSONObject()
+        root.put("identity", SecureStore.readSecureString(idFile) ?: "")
+        root.put("contacts", SecureStore.readSecureString(contactsFile) ?: "")
+        root.put("messages", SecureStore.readSecureString(messagesFile) ?: "")
+        root.put("groups", SecureStore.readSecureString(groupsFile) ?: "")
+        root.put("settings", SecureStore.readSecureString(settingsFile) ?: "")
+        val salt = Crypto.randomBytes(16)
+        val nonce = Crypto.randomBytes(12)
+        val key = Crypto.deriveKey(password, salt)
+        val ct = Crypto.aesGcmEncrypt(key, nonce, root.toString().toByteArray(Charsets.UTF_8))
+        return BACKUP_MAGIC + salt + nonce + ct
+    }
+
+    /** Yedeği çözer ve mevcut tüm verinin üzerine yazar. */
+    fun importBackup(bytes: ByteArray, password: String): Result<Unit> {
+        return try {
+            require(bytes.size > 33 && bytes.copyOfRange(0, 5).contentEquals(BACKUP_MAGIC)) { "Geçersiz yedek dosyası." }
+            val salt = bytes.copyOfRange(5, 21)
+            val nonce = bytes.copyOfRange(21, 33)
+            val ct = bytes.copyOfRange(33, bytes.size)
+            val key = Crypto.deriveKey(password, salt)
+            val plain = String(Crypto.aesGcmDecrypt(key, nonce, ct), Charsets.UTF_8)
+            val root = JSONObject(plain)
+            SecureStore.writeSecureString(idFile, root.optString("identity", ""))
+            SecureStore.writeSecureString(contactsFile, root.optString("contacts", "[]"))
+            SecureStore.writeSecureString(messagesFile, root.optString("messages", "{}"))
+            SecureStore.writeSecureString(groupsFile, root.optString("groups", "[]"))
+            SecureStore.writeSecureString(settingsFile, root.optString("settings", ""))
+            _identity.value = parseIdentity(root.optString("identity", ""))
+            _contacts.value = parseContacts(root.optString("contacts", "[]"))
+            _messages.value = parseMessages(root.optString("messages", "{}"))
+            _groups.value = parseGroups(root.optString("groups", "[]"))
+            _settings.value = parseSettings(root.optString("settings", ""))
+            if (_settings.value?.lockEnabled == true) _locked.value = true else _locked.value = false
+            persistIdentity(); persistSettings(); persistContacts(); persistMessages(); persistGroups()
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(Exception(e.message ?: "Yedek açılamadı (parola yanlış olabilir)."))
+        }
+    }
+
     /** Tüm yerel verileri siler ve yeni bir anonim kimlik üretir. */
     fun wipeAll() {
         idFile.delete(); contactsFile.delete(); messagesFile.delete(); settingsFile.delete(); groupsFile.delete()
@@ -499,7 +638,9 @@ object Repo {
         _contacts.value = emptyList()
         _messages.value = emptyMap()
         _groups.value = emptyList()
-        persistIdentity(); persistSettings(); persistContacts(); persistMessages()
+        _typing.value = emptySet()
+        _locked.value = false
+        persistIdentity(); persistSettings(); persistContacts(); persistMessages(); persistGroups()
     }
 
     // ---------------- Mesajlar ----------------
@@ -516,23 +657,19 @@ object Repo {
         persistMessages()
     }
 
-    private fun updateStatus(id: String, status: MessageStatus) {
+    private fun updateMessage(id: String, transform: (Message) -> Message) {
         val map = _messages.value.toMutableMap()
         val contactId = map.keys.firstOrNull { key -> map[key]!!.any { it.id == id } } ?: return
-        map[contactId] = map[contactId]!!.map { if (it.id == id) it.copy(status = status) else it }
+        map[contactId] = map[contactId]!!.map { if (it.id == id) transform(it) else it }
         _messages.value = map
         persistMessages()
     }
 
+    private fun updateStatus(id: String, status: MessageStatus) = updateMessage(id) { it.copy(status = status) }
+
     /** Tek seferlik (view-once) bir mesajı "görüldü" olarak işaretler ve içeriğini siler. */
     fun markViewed(id: String) {
-        val map = _messages.value.toMutableMap()
-        val contactId = map.keys.firstOrNull { key -> map[key]!!.any { it.id == id } } ?: return
-        map[contactId] = map[contactId]!!.map {
-            if (it.id == id) it.copy(viewed = true, text = "") else it
-        }
-        _messages.value = map
-        persistMessages()
+        updateMessage(id) { it.copy(viewed = true, text = "") }
     }
 
     private fun persistMessages() {
@@ -553,6 +690,10 @@ object Repo {
                         .put("senderId", m.senderId)
                         .put("viewOnce", m.viewOnce)
                         .put("viewed", m.viewed)
+                        .put("fileName", m.fileName)
+                        .put("replyToId", m.replyToId)
+                        .put("replyPreview", m.replyPreview)
+                        .put("reactions", reactionJson(m.reactions))
                 )
             }
             root.put(contactId, arr)
@@ -578,21 +719,49 @@ object Repo {
                     o.optString("groupId", ""),
                     o.optString("senderId", ""),
                     o.optBoolean("viewOnce", false),
-                    o.optBoolean("viewed", false)
+                    o.optBoolean("viewed", false),
+                    o.optString("fileName", ""),
+                    o.optString("replyToId", ""),
+                    o.optString("replyPreview", ""),
+                    parseReactions(o.optJSONObject("reactions"))
                 )
             }
         }
         return out
     }
 
-    fun sendMessage(contactId: String, text: String, type: String = "text", viewOnce: Boolean = false) {
+    private fun reactionJson(map: Map<String, String>): JSONObject {
+        val o = JSONObject()
+        for ((k, v) in map) o.put(k, v)
+        return o
+    }
+
+    private fun parseReactions(o: JSONObject?): Map<String, String> {
+        if (o == null) return emptyMap()
+        val m = HashMap<String, String>()
+        for (k in o.keys()) m[k] = o.optString(k, "")
+        return m
+    }
+
+    fun sendMessage(
+        contactId: String,
+        text: String,
+        type: String = "text",
+        viewOnce: Boolean = false,
+        fileName: String = "",
+        replyToId: String = "",
+        replyPreview: String = ""
+    ) {
         val contact = contactById(contactId) ?: return
         if (text.isBlank()) return
         val msgId = UUID.randomUUID().toString()
         val ts = System.currentTimeMillis()
-        appendMessage(Message(msgId, contactId, true, text, ts, MessageStatus.PENDING, type, "", _identity.value!!.userId, viewOnce, false))
+        appendMessage(
+            Message(msgId, contactId, true, text, ts, MessageStatus.PENDING, type, "", _identity.value!!.userId, viewOnce, false,
+                fileName, replyToId, replyPreview)
+        )
         scope.launch {
-            val inner = innerMessage(contact, text, ts, msgId, type, viewOnce)
+            val inner = innerMessage(contact, text, ts, msgId, type, viewOnce, fileName, replyToId, replyPreview)
             val isMqtt = _settings.value?.transport == "mqtt"
 
             var ok = transmit(contact, inner, Crypto.INFO_MSG)
@@ -615,7 +784,17 @@ object Repo {
         }
     }
 
-    private fun innerMessage(contact: Contact, text: String, ts: Long, msgId: String, type: String, viewOnce: Boolean): String {
+    private fun innerMessage(
+        contact: Contact,
+        text: String,
+        ts: Long,
+        msgId: String,
+        type: String,
+        viewOnce: Boolean,
+        fileName: String = "",
+        replyToId: String = "",
+        replyPreview: String = ""
+    ): String {
         val i = _identity.value!!
         return JSONObject()
             .put("type", "msg")
@@ -623,10 +802,113 @@ object Repo {
             .put("name", i.displayName)
             .put("mtype", type)
             .put("once", viewOnce)
+            .put("file", fileName)
+            .put("rid", replyToId)
+            .put("rprev", replyPreview)
             .put("body", text)
             .put("ts", ts)
             .put("id", msgId)
             .toString()
+    }
+
+    // ---------------- Yazıyor / okundu / tepki / ilet ----------------
+
+    /** Karşı tarafa "yazıyor" bilgisi gönderir (en fazla 3 saniyede bir). */
+    fun sendTyping(chatId: String, isGroup: Boolean) {
+        val now = System.currentTimeMillis()
+        if (now - (lastTypingSent[chatId] ?: 0L) < 3000) return
+        lastTypingSent[chatId] = now
+        scope.launch {
+            val inner = JSONObject()
+                .put("type", "typing")
+                .put("from", _identity.value!!.userId)
+                .put("gid", if (isGroup) chatId else "")
+                .toString()
+            if (isGroup) {
+                groupById(chatId)?.let { g ->
+                    for (m in g.members) {
+                        if (m.userId == _identity.value!!.userId) continue
+                        val c = contactById(m.userId) ?: continue
+                        transmit(c, inner, Crypto.INFO_MSG)
+                    }
+                }
+            } else {
+                contactById(chatId)?.let { transmit(it, inner, Crypto.INFO_MSG) }
+            }
+        }
+    }
+
+    fun isTyping(uid: String): Boolean = _typing.value.contains(uid)
+
+    private fun onTyping(uid: String) {
+        if (uid.isEmpty() || uid == _identity.value?.userId) return
+        _typing.value = _typing.value + uid
+        typingJobs[uid]?.cancel()
+        typingJobs[uid] = scope.launch {
+            delay(5000)
+            _typing.value = _typing.value - uid
+        }
+    }
+
+    /** Açılan sohbetteki okunmamış gelen mesajları okundu olarak işaretler ve bildirir. */
+    fun markChatRead(chatId: String, isGroup: Boolean) {
+        val list = messagesFor(chatId)
+        val unread = list.filter { !it.outgoing && it.status != MessageStatus.READ }
+        if (unread.isEmpty()) return
+        for (m in unread) updateStatus(m.id, MessageStatus.READ)
+        scope.launch {
+            val bySender = unread.filter { it.senderId.isNotEmpty() }.groupBy { it.senderId }
+            for ((sender, msgs) in bySender) {
+                val ids = JSONArray(); msgs.forEach { ids.put(it.id) }
+                val inner = JSONObject()
+                    .put("type", "read")
+                    .put("from", _identity.value!!.userId)
+                    .put("ids", ids)
+                    .toString()
+                contactById(sender)?.let { transmit(it, inner, Crypto.INFO_MSG) }
+            }
+        }
+    }
+
+    /** Bir mesaja emoji tepkisi verir (aynı emoji tekrar verilirse kaldırır). */
+    fun react(chatId: String, msgId: String, emoji: String, isGroup: Boolean) {
+        val me = _identity.value!!.userId
+        var newEmoji = emoji
+        updateMessage(msgId) {
+            val cur = it.reactions.toMutableMap()
+            if (cur[me] == emoji) { cur.remove(me); newEmoji = "" } else cur[me] = emoji
+            it.copy(reactions = cur)
+        }
+        scope.launch {
+            val inner = JSONObject()
+                .put("type", "reaction")
+                .put("from", me)
+                .put("id", msgId)
+                .put("emoji", newEmoji)
+                .put("gid", if (isGroup) chatId else "")
+                .toString()
+            if (isGroup) {
+                groupById(chatId)?.let { g ->
+                    for (m in g.members) {
+                        if (m.userId == me) continue
+                        val c = contactById(m.userId) ?: continue
+                        transmit(c, inner, Crypto.INFO_MSG)
+                    }
+                }
+            } else {
+                contactById(chatId)?.let { transmit(it, inner, Crypto.INFO_MSG) }
+            }
+        }
+    }
+
+    /** Bir mesajı başka bir sohbete iletir. */
+    fun forwardMessage(srcChatId: String, msgId: String, targetId: String, targetIsGroup: Boolean) {
+        val msg = messagesFor(srcChatId).firstOrNull { it.id == msgId } ?: return
+        val kind = if (msg.type == "image" || msg.type == "audio" || msg.type == "file") msg.type else "text"
+        val content = msg.text
+        val name = msg.fileName
+        if (targetIsGroup) sendGroupMessage(targetId, content, kind, false, name)
+        else sendMessage(targetId, content, kind, false, name)
     }
 
     /** Bir iç mesajı E2E şifreleyip gönderir; MQTT'de kopmuşsa yeniden bağlanıp dener. */
@@ -675,7 +957,7 @@ object Repo {
         return if (_settings.value?.transport == "mqtt") {
             mqtt?.publish(topicFor(contact.userId), body) ?: false
         } else {
-            relay.send(contact.relay, body)
+            relay.send(contact.relay, body, proxyOrNull())
         }
     }
 
@@ -689,7 +971,8 @@ object Repo {
         val s = _settings.value ?: return
         if (s.transport != "mqtt") return
         val me = _identity.value ?: return
-        val key = "${s.mqttHost}:${s.mqttPort}:${s.mqttTls}:${me.userId}"
+        val torKey = if (s.useTor) "tor:${s.torHost}:${s.torPort}" else "clear"
+        val key = "${s.mqttHost}:${s.mqttPort}:${s.mqttTls}:$torKey:${me.userId}"
         val existing = mqtt
         if (existing != null && mqttConfigKey == key) {
             existing.ensureConnected()
@@ -703,7 +986,9 @@ object Repo {
             clientId = "gizli-" + me.userId,
             topic = topicFor(me.userId),
             onMessage = { raw -> if (processIncoming(raw)) onNewMessage?.invoke(1) },
-            onConnected = { flushOutbox() }
+            onConnected = { flushOutbox() },
+            torHost = if (s.useTor) s.torHost.ifBlank { "127.0.0.1" } else null,
+            torPort = s.torPort
         )
         mqtt = t
         mqttConfigKey = key
@@ -752,7 +1037,7 @@ object Repo {
     suspend fun pollOnce(): Int {
         val s = _settings.value ?: return 0
         val me = _identity.value ?: return 0
-        val envelopes = relay.pull(s.relay, me.userId)
+        val envelopes = relay.pull(s.relay, me.userId, proxyOrNull())
         var newCount = 0
         for (raw in envelopes) {
             if (processIncoming(raw)) newCount++
@@ -763,20 +1048,25 @@ object Repo {
     private fun handlePlain(env: Envelope, plainJson: String): Boolean {
         val o = JSONObject(plainJson)
         val from = o.optString("from", "")
-        val name = o.optString("name", "Isimsiz")
+        val nameOpt = if (o.has("name")) o.optString("name", "") else null
         val senderPubB64 = B64.enc(env.senderPub)
         if (from.isEmpty()) return false
+
+        val type = o.optString("type", "msg")
+        val existing = contactById(from)
+
+        // Geçici bilgi paketleri (yazıyor/okundu/tepki) yeni kişi oluşturmaz.
+        if (existing == null && (type == "typing" || type == "read" || type == "reaction")) return false
 
         val avatar = if (o.has("avatar")) o.optString("avatar", "") else null
         val bio = if (o.has("bio")) o.optString("bio", "") else null
 
-        val existing = contactById(from)
         if (existing == null) {
             upsertContact(
                 Contact(
                     userId = from,
                     publicKey = senderPubB64,
-                    name = name.ifBlank { "Isimsiz" },
+                    name = (nameOpt ?: "").ifBlank { "Isimsiz" },
                     relay = _settings.value!!.relay,
                     addedAt = System.currentTimeMillis(),
                     pending = false,
@@ -785,10 +1075,9 @@ object Repo {
                 )
             )
         } else {
-            updateContactProfile(from, name, avatar, bio)
+            updateContactProfile(from, nameOpt ?: "", avatar, bio)
         }
 
-        val type = o.optString("type", "msg")
         when (type) {
             "profile" -> {
                 return false
@@ -812,7 +1101,7 @@ object Repo {
                             keyB64 = "",
                             members = listOf(
                                 GroupMember(me.userId, me.encPublic, me.displayName),
-                                GroupMember(from, senderPubB64, name)
+                                GroupMember(from, senderPubB64, (nameOpt ?: "").ifBlank { "Isimsiz" })
                             ),
                             createdAt = System.currentTimeMillis()
                         )
@@ -825,7 +1114,8 @@ object Repo {
                         msgId, gid, false, o.optString("body", ""),
                         o.optLong("ts", System.currentTimeMillis()), MessageStatus.DELIVERED,
                         o.optString("mtype", "text"), gid, from,
-                        o.optBoolean("once", false), false
+                        o.optBoolean("once", false), false,
+                        o.optString("file", ""), o.optString("rid", ""), o.optString("rprev", "")
                     )
                 )
                 return true
@@ -838,10 +1128,32 @@ object Repo {
                         msgId, from, false, o.optString("body", ""),
                         o.optLong("ts", System.currentTimeMillis()), MessageStatus.DELIVERED,
                         o.optString("mtype", "text"), "", from,
-                        o.optBoolean("once", false), false
+                        o.optBoolean("once", false), false,
+                        o.optString("file", ""), o.optString("rid", ""), o.optString("rprev", "")
                     )
                 )
                 return true
+            }
+            "typing" -> {
+                onTyping(from)
+                return false
+            }
+            "read" -> {
+                val ids = o.optJSONArray("ids")
+                if (ids != null) for (i in 0 until ids.length()) {
+                    updateStatus(ids.getString(i), MessageStatus.READ)
+                }
+                return false
+            }
+            "reaction" -> {
+                val mid = o.optString("id", "")
+                val emoji = o.optString("emoji", "")
+                if (mid.isNotEmpty()) updateMessage(mid) {
+                    val cur = it.reactions.toMutableMap()
+                    if (emoji.isBlank()) cur.remove(from) else cur[from] = emoji
+                    it.copy(reactions = cur)
+                }
+                return false
             }
             "hello" -> {
                 // Karşı taraf bizi yeni ekledi: biz de profilimizi geri gönderelim.

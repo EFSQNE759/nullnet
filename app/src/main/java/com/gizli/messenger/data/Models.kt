@@ -31,10 +31,14 @@ data class Message(
     val groupId: String = "",
     val senderId: String = "",
     val viewOnce: Boolean = false,
-    val viewed: Boolean = false
+    val viewed: Boolean = false,
+    val fileName: String = "",
+    val replyToId: String = "",
+    val replyPreview: String = "",
+    val reactions: Map<String, String> = emptyMap()
 )
 
-enum class MessageStatus { PENDING, SENT, DELIVERED, FAILED }
+enum class MessageStatus { PENDING, SENT, DELIVERED, READ, FAILED }
 
 data class GroupMember(
     val userId: String,
@@ -60,5 +64,13 @@ data class Settings(
     val mqttPort: Int = 8883,
     val mqttTls: Boolean = true,
     val theme: String = "default",
-    val secureScreen: Boolean = true
+    val secureScreen: Boolean = true,
+    val useTor: Boolean = false,
+    val torHost: String = "127.0.0.1",
+    val torPort: Int = 9050,
+    val lockEnabled: Boolean = false,
+    val pinHash: String = "",
+    val pinSalt: String = "",
+    val duressHash: String = "",
+    val duressSalt: String = ""
 )
