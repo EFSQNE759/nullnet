@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)][int]$VersionCode,
     [Parameter(Mandatory = $true)][string]$VersionName,
     [string]$Notes = "",
-    [string]$UpdateUrl = "https://github.com/EFSQNE759/nullnet/releases/latest/download/update.json"
+    [string]$UpdateUrl = "https://github.com/EFSQNE759/nullnet/releases/latest/download/app-release.apk"
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path | Split-Path -Parent

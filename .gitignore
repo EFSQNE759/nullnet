@@ -10,3 +10,4 @@ release.keystore
 tools/update_key_private.b64
 captures/
 .DS_Store
+update.json
