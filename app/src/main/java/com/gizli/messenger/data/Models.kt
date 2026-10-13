@@ -4,7 +4,9 @@ data class Identity(
     val userId: String,
     val encPublic: String,
     val encPrivate: String,
-    val displayName: String
+    val displayName: String,
+    val avatarB64: String = "",
+    val bio: String = ""
 )
 
 data class Contact(
@@ -13,7 +15,9 @@ data class Contact(
     val name: String,
     val relay: String,
     val addedAt: Long,
-    val pending: Boolean = false
+    val pending: Boolean = false,
+    val avatarB64: String = "",
+    val bio: String = ""
 )
 
 data class Message(
@@ -25,7 +29,9 @@ data class Message(
     val status: MessageStatus,
     val type: String = "text",
     val groupId: String = "",
-    val senderId: String = ""
+    val senderId: String = "",
+    val viewOnce: Boolean = false,
+    val viewed: Boolean = false
 )
 
 enum class MessageStatus { PENDING, SENT, DELIVERED, FAILED }
@@ -41,7 +47,8 @@ data class Group(
     val name: String,
     val keyB64: String,
     val members: List<GroupMember>,
-    val createdAt: Long
+    val createdAt: Long,
+    val avatarB64: String = ""
 )
 
 data class Settings(
@@ -51,5 +58,7 @@ data class Settings(
     val transport: String = "mqtt",
     val mqttHost: String = "broker.hivemq.com",
     val mqttPort: Int = 8883,
-    val mqttTls: Boolean = true
+    val mqttTls: Boolean = true,
+    val theme: String = "default",
+    val secureScreen: Boolean = true
 )

@@ -94,6 +94,12 @@ object Repo {
         persistIdentity(); persistSettings()
     }
 
+    fun setProfile(avatarB64: String, bio: String) {
+        _identity.value = _identity.value!!.copy(avatarB64 = avatarB64, bio = bio)
+        persistIdentity()
+        broadcastProfile()
+    }
+
     private fun persistIdentity() {
         val i = _identity.value ?: return
         val o = JSONObject()
@@ -101,6 +107,8 @@ object Repo {
             .put("encPublic", i.encPublic)
             .put("encPrivate", i.encPrivate)
             .put("displayName", i.displayName)
+            .put("avatarB64", i.avatarB64)
+            .put("bio", i.bio)
         SecureStore.writeSecureString(idFile, o.toString())
     }
 
@@ -110,8 +118,28 @@ object Repo {
             o.getString("userId"),
             o.getString("encPublic"),
             o.getString("encPrivate"),
-            o.optString("displayName", "")
+            o.optString("displayName", ""),
+            o.optString("avatarB64", ""),
+            o.optString("bio", "")
         )
+    }
+
+    /** Profil bilgisini (ad, avatar, bio) tüm kişilere bildirir. */
+    private fun broadcastProfile() {
+        val me = _identity.value ?: return
+        scope.launch {
+            val inner = JSONObject()
+                .put("type", "profile")
+                .put("from", me.userId)
+                .put("name", me.displayName)
+                .put("avatar", me.avatarB64)
+                .put("bio", me.bio)
+                .put("ts", System.currentTimeMillis())
+                .toString()
+            for (c in _contacts.value) {
+                transmit(c, inner, Crypto.INFO_HELLO)
+            }
+        }
     }
 
     // ---------------- Ayarlar ----------------
@@ -146,6 +174,16 @@ object Repo {
         persistSettings()
     }
 
+    fun setTheme(name: String) {
+        _settings.value = _settings.value!!.copy(theme = name)
+        persistSettings()
+    }
+
+    fun setSecureScreen(enabled: Boolean) {
+        _settings.value = _settings.value!!.copy(secureScreen = enabled)
+        persistSettings()
+    }
+
     private fun persistSettings() {
         val s = _settings.value ?: return
         val o = JSONObject()
@@ -156,6 +194,8 @@ object Repo {
             .put("mqttHost", s.mqttHost)
             .put("mqttPort", s.mqttPort)
             .put("mqttTls", s.mqttTls)
+            .put("theme", s.theme)
+            .put("secureScreen", s.secureScreen)
         SecureStore.writeSecureString(settingsFile, o.toString())
     }
 
@@ -168,7 +208,9 @@ object Repo {
             o.optString("transport", "mqtt"),
             o.optString("mqttHost", "broker.hivemq.com"),
             o.optInt("mqttPort", 8883),
-            o.optBoolean("mqttTls", true)
+            o.optBoolean("mqttTls", true),
+            o.optString("theme", "default"),
+            o.optBoolean("secureScreen", true)
         )
     }
 
@@ -219,6 +261,22 @@ object Repo {
         persistContacts()
     }
 
+    /** Gelen profil bilgisine göre kişinin ad/avatar/bio alanlarını günceller. */
+    private fun updateContactProfile(userId: String, name: String, avatar: String?, bio: String?) {
+        if (name.isBlank() && avatar == null && bio == null) return
+        val list = _contacts.value.toMutableList()
+        val idx = list.indexOfFirst { it.userId == userId }
+        if (idx < 0) return
+        val c = list[idx]
+        list[idx] = c.copy(
+            name = if (name.isNotBlank()) name else c.name,
+            avatarB64 = avatar ?: c.avatarB64,
+            bio = bio ?: c.bio
+        )
+        _contacts.value = list
+        persistContacts()
+    }
+
     private fun persistContacts() {
         val arr = JSONArray()
         for (c in _contacts.value) {
@@ -230,6 +288,8 @@ object Repo {
                     .put("relay", c.relay)
                     .put("addedAt", c.addedAt)
                     .put("pending", c.pending)
+                    .put("avatarB64", c.avatarB64)
+                    .put("bio", c.bio)
             )
         }
         SecureStore.writeSecureString(contactsFile, arr.toString())
@@ -245,7 +305,9 @@ object Repo {
                 o.optString("name", "Isimsiz"),
                 o.optString("relay", BuildConfig.DEFAULT_RELAY),
                 o.optLong("addedAt", 0),
-                o.optBoolean("pending", false)
+                o.optBoolean("pending", false),
+                o.optString("avatarB64", ""),
+                o.optString("bio", "")
             )
         }
     }
@@ -289,6 +351,7 @@ object Repo {
             .put("key", g.keyB64)
             .put("members", members)
             .put("createdAt", g.createdAt)
+            .put("avatar", g.avatarB64)
     }
 
     private fun groupFromJson(o: JSONObject): Group {
@@ -303,7 +366,8 @@ object Repo {
             name = o.optString("name", "Grup"),
             keyB64 = o.optString("key", ""),
             members = members,
-            createdAt = o.optLong("createdAt", System.currentTimeMillis())
+            createdAt = o.optLong("createdAt", System.currentTimeMillis()),
+            avatarB64 = o.optString("avatar", "")
         )
     }
 
@@ -313,7 +377,7 @@ object Repo {
     }
 
     /** Grup kurar, anahtarı her üyeye 1:1 E2E kanalından gönderir. */
-    fun createGroup(name: String, memberIds: List<String>): Group {
+    fun createGroup(name: String, memberIds: List<String>, avatarB64: String = ""): Group {
         val me = _identity.value!!
         val key = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
         val members = ArrayList<GroupMember>()
@@ -327,9 +391,17 @@ object Repo {
             name = name.trim().ifBlank { "Grup" },
             keyB64 = B64.enc(key),
             members = members,
-            createdAt = System.currentTimeMillis()
+            createdAt = System.currentTimeMillis(),
+            avatarB64 = avatarB64
         )
         upsertGroup(group)
+        broadcastGroup(group)
+        return group
+    }
+
+    /** Grubun güncel tanımını (ad, avatar, üyeler) tüm üyelere gönderir. */
+    private fun broadcastGroup(group: Group) {
+        val me = _identity.value ?: return
         scope.launch {
             val invite = JSONObject()
                 .put("type", "group_invite")
@@ -343,7 +415,43 @@ object Repo {
                 transmitWithRetry(c, invite, Crypto.INFO_MSG)
             }
         }
-        return group
+    }
+
+    /** Gruba yeni üyeler ekler ve güncel tanımı herkese bildirir. */
+    fun addGroupMembers(groupId: String, memberIds: List<String>): Group? {
+        val group = groupById(groupId) ?: return null
+        val members = group.members.toMutableList()
+        val existing = members.map { it.userId }.toSet()
+        for (id in memberIds) {
+            if (existing.contains(id)) continue
+            val c = contactById(id) ?: continue
+            members.add(GroupMember(c.userId, c.publicKey, c.name))
+        }
+        val updated = group.copy(members = members)
+        upsertGroup(updated)
+        broadcastGroup(updated)
+        return updated
+    }
+
+    /** Grup adını veya fotoğrafını günceller ve herkese bildirir. */
+    fun updateGroup(groupId: String, name: String, avatarB64: String): Group? {
+        val group = groupById(groupId) ?: return null
+        val updated = group.copy(
+            name = name.trim().ifBlank { group.name },
+            avatarB64 = avatarB64
+        )
+        upsertGroup(updated)
+        broadcastGroup(updated)
+        return updated
+    }
+
+    fun removeGroupMember(groupId: String, userId: String): Group? {
+        val group = groupById(groupId) ?: return null
+        if (userId == _identity.value?.userId) return null
+        val updated = group.copy(members = group.members.filterNot { it.userId == userId })
+        upsertGroup(updated)
+        broadcastGroup(updated)
+        return updated
     }
 
     fun removeGroup(id: String) {
@@ -352,13 +460,13 @@ object Repo {
         persistGroups(); persistMessages()
     }
 
-    fun sendGroupMessage(groupId: String, content: String, type: String = "text") {
+    fun sendGroupMessage(groupId: String, content: String, type: String = "text", viewOnce: Boolean = false) {
         val group = groupById(groupId) ?: return
         if (content.isBlank()) return
         val me = _identity.value!!
         val msgId = UUID.randomUUID().toString()
         val ts = System.currentTimeMillis()
-        appendMessage(Message(msgId, groupId, true, content, ts, MessageStatus.PENDING, type, groupId, me.userId))
+        appendMessage(Message(msgId, groupId, true, content, ts, MessageStatus.PENDING, type, groupId, me.userId, viewOnce, false))
         scope.launch {
             val inner = JSONObject()
                 .put("type", "group_msg")
@@ -367,6 +475,7 @@ object Repo {
                 .put("gid", groupId)
                 .put("gname", group.name)
                 .put("mtype", type)
+                .put("once", viewOnce)
                 .put("body", content)
                 .put("ts", ts)
                 .put("id", msgId)
@@ -378,6 +487,7 @@ object Repo {
                 if (transmitWithRetry(c, inner, Crypto.INFO_MSG)) anyOk = true
             }
             updateStatus(msgId, if (anyOk) MessageStatus.SENT else MessageStatus.FAILED)
+            if (viewOnce && anyOk) markViewed(msgId)
         }
     }
 
@@ -414,6 +524,17 @@ object Repo {
         persistMessages()
     }
 
+    /** Tek seferlik (view-once) bir mesajı "görüldü" olarak işaretler ve içeriğini siler. */
+    fun markViewed(id: String) {
+        val map = _messages.value.toMutableMap()
+        val contactId = map.keys.firstOrNull { key -> map[key]!!.any { it.id == id } } ?: return
+        map[contactId] = map[contactId]!!.map {
+            if (it.id == id) it.copy(viewed = true, text = "") else it
+        }
+        _messages.value = map
+        persistMessages()
+    }
+
     private fun persistMessages() {
         val root = JSONObject()
         for ((contactId, list) in _messages.value) {
@@ -430,6 +551,8 @@ object Repo {
                         .put("type", m.type)
                         .put("groupId", m.groupId)
                         .put("senderId", m.senderId)
+                        .put("viewOnce", m.viewOnce)
+                        .put("viewed", m.viewed)
                 )
             }
             root.put(contactId, arr)
@@ -453,21 +576,23 @@ object Repo {
                     MessageStatus.valueOf(o.optString("status", "SENT")),
                     o.optString("type", "text"),
                     o.optString("groupId", ""),
-                    o.optString("senderId", "")
+                    o.optString("senderId", ""),
+                    o.optBoolean("viewOnce", false),
+                    o.optBoolean("viewed", false)
                 )
             }
         }
         return out
     }
 
-    fun sendMessage(contactId: String, text: String, type: String = "text") {
+    fun sendMessage(contactId: String, text: String, type: String = "text", viewOnce: Boolean = false) {
         val contact = contactById(contactId) ?: return
         if (text.isBlank()) return
         val msgId = UUID.randomUUID().toString()
         val ts = System.currentTimeMillis()
-        appendMessage(Message(msgId, contactId, true, text, ts, MessageStatus.PENDING, type, "", _identity.value!!.userId))
+        appendMessage(Message(msgId, contactId, true, text, ts, MessageStatus.PENDING, type, "", _identity.value!!.userId, viewOnce, false))
         scope.launch {
-            val inner = innerMessage(contact, text, ts, msgId, type)
+            val inner = innerMessage(contact, text, ts, msgId, type, viewOnce)
             val isMqtt = _settings.value?.transport == "mqtt"
 
             var ok = transmit(contact, inner, Crypto.INFO_MSG)
@@ -486,16 +611,18 @@ object Repo {
                 }
             }
             updateStatus(msgId, if (ok) MessageStatus.SENT else MessageStatus.FAILED)
+            if (viewOnce && ok) markViewed(msgId)
         }
     }
 
-    private fun innerMessage(contact: Contact, text: String, ts: Long, msgId: String, type: String): String {
+    private fun innerMessage(contact: Contact, text: String, ts: Long, msgId: String, type: String, viewOnce: Boolean): String {
         val i = _identity.value!!
         return JSONObject()
             .put("type", "msg")
             .put("from", i.userId)
             .put("name", i.displayName)
             .put("mtype", type)
+            .put("once", viewOnce)
             .put("body", text)
             .put("ts", ts)
             .put("id", msgId)
@@ -523,6 +650,8 @@ object Repo {
                 .put("type", "hello")
                 .put("from", i.userId)
                 .put("name", i.displayName)
+                .put("avatar", i.avatarB64)
+                .put("bio", i.bio)
                 .put("ts", System.currentTimeMillis())
                 .toString()
             transmit(contact, inner, Crypto.INFO_HELLO)
@@ -638,6 +767,9 @@ object Repo {
         val senderPubB64 = B64.enc(env.senderPub)
         if (from.isEmpty()) return false
 
+        val avatar = if (o.has("avatar")) o.optString("avatar", "") else null
+        val bio = if (o.has("bio")) o.optString("bio", "") else null
+
         val existing = contactById(from)
         if (existing == null) {
             upsertContact(
@@ -647,18 +779,24 @@ object Repo {
                     name = name.ifBlank { "Isimsiz" },
                     relay = _settings.value!!.relay,
                     addedAt = System.currentTimeMillis(),
-                    pending = false
+                    pending = false,
+                    avatarB64 = avatar ?: "",
+                    bio = bio ?: ""
                 )
             )
+        } else {
+            updateContactProfile(from, name, avatar, bio)
         }
 
         val type = o.optString("type", "msg")
         when (type) {
+            "profile" -> {
+                return false
+            }
             "group_invite" -> {
                 val g = o.optJSONObject("group") ?: return false
                 val incoming = groupFromJson(g)
                 val prev = groupById(incoming.id)
-                // Mevcut üye anahtarları varsa koru; gelen tanım daha günceldir.
                 upsertGroup(incoming)
                 return prev == null
             }
@@ -686,7 +824,8 @@ object Repo {
                     Message(
                         msgId, gid, false, o.optString("body", ""),
                         o.optLong("ts", System.currentTimeMillis()), MessageStatus.DELIVERED,
-                        o.optString("mtype", "text"), gid, from
+                        o.optString("mtype", "text"), gid, from,
+                        o.optBoolean("once", false), false
                     )
                 )
                 return true
@@ -698,13 +837,21 @@ object Repo {
                     Message(
                         msgId, from, false, o.optString("body", ""),
                         o.optLong("ts", System.currentTimeMillis()), MessageStatus.DELIVERED,
-                        o.optString("mtype", "text"), "", from
+                        o.optString("mtype", "text"), "", from,
+                        o.optBoolean("once", false), false
                     )
                 )
                 return true
             }
+            "hello" -> {
+                // Karşı taraf bizi yeni ekledi: biz de profilimizi geri gönderelim.
+                if (existing == null) {
+                    contactById(from)?.let { sendHello(it) }
+                }
+                return existing == null
+            }
         }
-        // hello: yeni kişi eklendi, mesaj sayılmaz
+        // bilinmeyen tür
         return existing == null
     }
 }

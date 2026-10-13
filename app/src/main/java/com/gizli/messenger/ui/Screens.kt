@@ -28,16 +28,25 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
@@ -47,6 +56,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -72,6 +83,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -82,6 +94,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import com.gizli.messenger.BuildConfig
 import com.gizli.messenger.data.Contact
 import com.gizli.messenger.data.Group
@@ -101,6 +114,7 @@ import java.util.Locale
 private sealed interface Screen {
     data object Home : Screen
     data class Chat(val contactId: String) : Screen
+    data class GroupInfo(val groupId: String) : Screen
     data object Add : Screen
     data object Settings : Screen
     data object Update : Screen
@@ -117,6 +131,17 @@ fun GizliApp() {
 
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     var showCreateGroup by remember { mutableStateOf(false) }
+
+    // Ekran görüntüsü engeli (FLAG_SECURE)
+    val secure = settings?.secureScreen ?: true
+    val activity = context as? android.app.Activity
+    LaunchedEffect(secure) {
+        val w = activity?.window ?: return@LaunchedEffect
+        if (secure) w.setFlags(
+            android.view.WindowManager.LayoutParams.FLAG_SECURE,
+            android.view.WindowManager.LayoutParams.FLAG_SECURE
+        ) else w.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+    }
 
     // Ön plan bağlantısı: MQTT ise sürekli açık tut, relay ise sık yokla
     LaunchedEffect(identity, settings) {
@@ -136,7 +161,7 @@ fun GizliApp() {
         }
     }
 
-    GizliTheme {
+    GizliTheme(themeId = settings?.theme ?: "default") {
         val id = identity
         when {
             id == null -> CenterLoading()
@@ -165,6 +190,7 @@ fun GizliApp() {
                         val contact = Repo.contactById(chatId)
                         ChatScreen(
                             title = group?.name ?: contact?.name ?: "Sohbet",
+                            avatarB64 = group?.avatarB64 ?: contact?.avatarB64 ?: "",
                             isGroup = group != null,
                             messages = allMessages[chatId].orEmpty(),
                             nameOf = { uid ->
@@ -172,14 +198,34 @@ fun GizliApp() {
                                 else Repo.contactById(uid)?.name ?: uid.take(8)
                             },
                             onBack = { screen = Screen.Home },
+                            onGroupInfo = if (group != null) ({ screen = Screen.GroupInfo(chatId) }) else null,
                             onSend = { t ->
                                 if (group != null) Repo.sendGroupMessage(chatId, t) else Repo.sendMessage(chatId, t)
                             },
-                            onSendImage = { b64 ->
-                                if (group != null) Repo.sendGroupMessage(chatId, b64, "image")
-                                else Repo.sendMessage(chatId, b64, "image")
-                            }
+                            onSendImage = { b64, once ->
+                                if (group != null) Repo.sendGroupMessage(chatId, b64, "image", once)
+                                else Repo.sendMessage(chatId, b64, "image", once)
+                            },
+                            onViewOnce = { mid -> Repo.markViewed(mid) }
                         )
+                    }
+
+                    is Screen.GroupInfo -> {
+                        val g = Repo.groupById(s.groupId)
+                        if (g == null) {
+                            screen = Screen.Home
+                        } else {
+                            GroupInfoScreen(
+                                group = g,
+                                contacts = contacts,
+                                myId = Repo.identity.value?.userId ?: "",
+                                onBack = { screen = Screen.Chat(g.id) },
+                                onUpdate = { name, avatar -> Repo.updateGroup(g.id, name, avatar) },
+                                onAddMembers = { ids -> Repo.addGroupMembers(g.id, ids) },
+                                onRemoveMember = { uid -> Repo.removeGroupMember(g.id, uid) },
+                                onDelete = { Repo.removeGroup(g.id); screen = Screen.Home }
+                            )
+                        }
                     }
 
                     Screen.Add -> AddContactScreen(onBack = { screen = Screen.Home })
@@ -196,8 +242,8 @@ fun GizliApp() {
                     CreateGroupDialog(
                         contacts = contacts,
                         onDismiss = { showCreateGroup = false },
-                        onCreate = { gname, ids ->
-                            Repo.createGroup(gname, ids)
+                        onCreate = { gname, ids, gavatar ->
+                            Repo.createGroup(gname, ids, gavatar)
                             showCreateGroup = false
                         }
                     )
@@ -304,6 +350,7 @@ private fun HomeScreen(
                             title = g.name,
                             subtitle = preview(last),
                             avatarText = g.name.take(1).uppercase(),
+                            avatarB64 = g.avatarB64,
                             isGroup = true,
                             onClick = { onOpen(g.id) }
                         )
@@ -318,6 +365,7 @@ private fun HomeScreen(
                             title = c.name,
                             subtitle = preview(last) ?: (c.userId.take(12) + "…"),
                             avatarText = c.name.take(1).uppercase(),
+                            avatarB64 = c.avatarB64,
                             isGroup = false,
                             onClick = { onOpen(c.userId) }
                         )
@@ -351,6 +399,7 @@ private fun ConversationRow(
     title: String,
     subtitle: String?,
     avatarText: String,
+    avatarB64: String,
     isGroup: Boolean,
     onClick: () -> Unit
 ) {
@@ -358,15 +407,7 @@ private fun ConversationRow(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Surface(
-            shape = RoundedCornerShape(50),
-            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
-            modifier = Modifier.size(44.dp)
-        ) {
-            Box(contentAlignment = Alignment.Center) {
-                Text(avatarText, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-            }
-        }
+        AvatarB64(b64 = avatarB64, fallback = avatarText, size = 44.dp)
         Spacer(Modifier.width(12.dp))
         Column(Modifier.fillMaxWidth()) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -388,35 +429,97 @@ private fun ConversationRow(
     }
 }
 
+/** Base64 avatarı (varsa) yuvarlak gösterir, yoksa baş harfi. */
+@Composable
+fun AvatarB64(b64: String, fallback: String, size: androidx.compose.ui.unit.Dp) {
+    val bmp = remember(b64) { decodeB64Bitmap(b64) }
+    Surface(
+        shape = CircleShape,
+        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
+        modifier = Modifier.size(size)
+    ) {
+        if (bmp != null) {
+            Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize().clip(CircleShape)
+            )
+        } else {
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    fallback.ifBlank { "?" },
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+    }
+}
+
+private fun decodeB64Bitmap(b64: String): android.graphics.Bitmap? {
+    if (b64.isBlank()) return null
+    return runCatching {
+        val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    }.getOrNull()
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ChatScreen(
     title: String,
+    avatarB64: String,
     isGroup: Boolean,
     messages: List<Message>,
     nameOf: (String) -> String,
     onBack: () -> Unit,
+    onGroupInfo: (() -> Unit)?,
     onSend: (String) -> Unit,
-    onSendImage: (String) -> Unit
+    onSendImage: (String, Boolean) -> Unit,
+    onViewOnce: (String) -> Unit
 ) {
     val context = LocalContext.current
     var text by remember { mutableStateOf("") }
+    var imageMenu by remember { mutableStateOf(false) }
+    var pendingOnce by remember { mutableStateOf(false) }
+    var viewing by remember { mutableStateOf<Message?>(null) }
+    var pendingDownload by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
+
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) {
             val b64 = compressImageToBase64(context, uri)
-            if (b64 != null) onSendImage(b64)
+            if (b64 != null) onSendImage(b64, pendingOnce)
+            pendingOnce = false
         }
     }
+    val downloader = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("image/jpeg")) { uri ->
+        val data = pendingDownload
+        if (uri != null && data != null) saveBase64ToUri(context, uri, data)
+        pendingDownload = null
+    }
+
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
     }
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(title) },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        AvatarB64(b64 = avatarB64, fallback = title.take(1).uppercase(), size = 34.dp)
+                        Spacer(Modifier.width(10.dp))
+                        Text(title)
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "Geri") }
+                },
+                actions = {
+                    if (onGroupInfo != null) {
+                        IconButton(onClick = onGroupInfo) { Icon(Icons.Filled.MoreVert, "Grup bilgisi") }
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface)
             )
@@ -431,7 +534,8 @@ private fun ChatScreen(
                 items(messages, key = { it.id }) { m ->
                     MessageBubble(
                         m = m,
-                        senderName = if (isGroup && !m.outgoing) nameOf(m.senderId) else null
+                        senderName = if (isGroup && !m.outgoing) nameOf(m.senderId) else null,
+                        onOpenImage = { viewing = m }
                     )
                 }
             }
@@ -439,8 +543,22 @@ private fun ChatScreen(
                 Modifier.fillMaxWidth().navigationBarsPadding().padding(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(onClick = { picker.launch("image/*") }) {
-                    Icon(Icons.Filled.Image, "Fotoğraf", tint = MaterialTheme.colorScheme.primary)
+                Box {
+                    IconButton(onClick = { imageMenu = true }) {
+                        Icon(Icons.Filled.Image, "Fotoğraf", tint = MaterialTheme.colorScheme.primary)
+                    }
+                    DropdownMenu(expanded = imageMenu, onDismissRequest = { imageMenu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Fotoğraf gönder") },
+                            leadingIcon = { Icon(Icons.Filled.Image, null) },
+                            onClick = { imageMenu = false; pendingOnce = false; picker.launch("image/*") }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Tek seferlik fotoğraf") },
+                            leadingIcon = { Icon(Icons.Filled.Lock, null) },
+                            onClick = { imageMenu = false; pendingOnce = true; picker.launch("image/*") }
+                        )
+                    }
                 }
                 OutlinedTextField(
                     value = text,
@@ -457,10 +575,24 @@ private fun ChatScreen(
             }
         }
     }
+
+    viewing?.let { msg ->
+        ImageViewer(
+            message = msg,
+            onClose = {
+                if (msg.viewOnce && !msg.outgoing) onViewOnce(msg.id)
+                viewing = null
+            },
+            onDownload = if (!msg.viewOnce && msg.text.isNotBlank()) ({
+                pendingDownload = msg.text
+                downloader.launch("nullnet_" + msg.id.take(8) + ".jpg")
+            }) else null
+        )
+    }
 }
 
 @Composable
-private fun MessageBubble(m: Message, senderName: String?) {
+private fun MessageBubble(m: Message, senderName: String?, onOpenImage: () -> Unit) {
     val isOut = m.outgoing
     val bubbleColor = if (isOut) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
     else MaterialTheme.colorScheme.surfaceVariant
@@ -477,10 +609,26 @@ private fun MessageBubble(m: Message, senderName: String?) {
                 )
             }
             Surface(color = bubbleColor, shape = RoundedCornerShape(14.dp)) {
-                if (m.type == "image") {
-                    ImageBubble(m.text)
-                } else {
-                    Text(m.text, Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+                when {
+                    m.type == "image" && m.viewOnce -> {
+                        val label = when {
+                            m.text.isNotBlank() && !isOut -> "Tek seferlik fotoğraf · açmak için dokun"
+                            isOut && m.text.isNotBlank() -> "Tek seferlik fotoğraf · gönderiliyor"
+                            isOut -> "Tek seferlik fotoğraf gönderildi"
+                            else -> "Tek seferlik fotoğraf görüntülendi"
+                        }
+                        Row(
+                            Modifier.clickable(enabled = m.text.isNotBlank()) { onOpenImage() }
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Filled.Lock, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                            Spacer(Modifier.width(6.dp))
+                            Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    m.type == "image" -> ImageBubble(m.text, onClick = onOpenImage)
+                    else -> Text(m.text, Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
                 }
             }
             Text(
@@ -494,22 +642,69 @@ private fun MessageBubble(m: Message, senderName: String?) {
 }
 
 @Composable
-private fun ImageBubble(b64: String) {
-    val bmp = remember(b64) {
-        runCatching {
-            val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
-            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        }.getOrNull()
-    }
+private fun ImageBubble(b64: String, onClick: () -> Unit) {
+    val bmp = remember(b64) { decodeB64Bitmap(b64) }
     if (bmp != null) {
         Image(
             bitmap = bmp.asImageBitmap(),
             contentDescription = null,
             contentScale = ContentScale.Fit,
-            modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 320.dp).padding(4.dp)
+            modifier = Modifier
+                .widthIn(max = 240.dp)
+                .heightIn(max = 320.dp)
+                .clickable(onClick = onClick)
+                .padding(4.dp)
         )
     } else {
         Text("[fotoğraf]", Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+    }
+}
+
+@Composable
+private fun ImageViewer(message: Message, onClose: () -> Unit, onDownload: (() -> Unit)?) {
+    Dialog(onDismissRequest = onClose) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            val bmp = remember(message.text) { decodeB64Bitmap(message.text) }
+            if (bmp != null) {
+                Image(
+                    bitmap = bmp.asImageBitmap(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp)
+                )
+            } else {
+                Text("İçerik yok", color = Color.White)
+            }
+            Spacer(Modifier.height(12.dp))
+            Row {
+                if (onDownload != null) {
+                    Button(onClick = onDownload) {
+                        Icon(Icons.Filled.Download, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp))
+                        Text("İndir")
+                    }
+                    Spacer(Modifier.width(10.dp))
+                }
+                OutlinedButton(onClick = onClose) {
+                    if (message.viewOnce && message.text.isNotBlank()) {
+                        Icon(Icons.Filled.Lock, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp))
+                        Text("Kapat (tek seferlik)")
+                    } else {
+                        Text("Kapat")
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Base64 görseli, kullanıcının seçtiği hedefe yazar. */
+private fun saveBase64ToUri(context: Context, uri: Uri, b64: String) {
+    runCatching {
+        val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+        context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
     }
 }
 
@@ -527,6 +722,26 @@ private fun compressImageToBase64(context: Context, uri: Uri): String? {
             ?: return null
         val out = ByteArrayOutputStream()
         bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 65, out)
+        android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+    } catch (e: Exception) {
+        null
+    }
+}
+
+/** Avatar için daha küçük (~256px) sıkıştırma. */
+private fun compressAvatarToBase64(context: Context, uri: Uri): String? {
+    return try {
+        val cr = context.contentResolver
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        cr.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, bounds) }
+        var sample = 1
+        val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+        while (maxDim / sample > 256) sample *= 2
+        val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+        val bmp = cr.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }
+            ?: return null
+        val out = ByteArrayOutputStream()
+        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 75, out)
         android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
     } catch (e: Exception) {
         null
@@ -622,11 +837,20 @@ private fun SettingsScreen(onBack: () -> Unit, onWiped: () -> Unit) {
     val identity by Repo.identity.collectAsState()
     var relay by remember { mutableStateOf(settings?.relay ?: "") }
     var name by remember { mutableStateOf(identity?.displayName ?: "") }
+    var bio by remember { mutableStateOf(identity?.bio ?: "") }
+    var avatar by remember { mutableStateOf(identity?.avatarB64 ?: "") }
     var transport by remember { mutableStateOf(settings?.transport ?: "mqtt") }
     var mqttHost by remember { mutableStateOf(settings?.mqttHost ?: "broker.hivemq.com") }
     var mqttPort by remember { mutableStateOf((settings?.mqttPort ?: 8883).toString()) }
     var mqttTls by remember { mutableStateOf(settings?.mqttTls ?: true) }
     var confirmWipe by remember { mutableStateOf(false) }
+
+    val avatarPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            val b64 = compressAvatarToBase64(context, uri)
+            if (b64 != null) avatar = b64
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -640,12 +864,77 @@ private fun SettingsScreen(onBack: () -> Unit, onWiped: () -> Unit) {
         Column(
             Modifier.fillMaxSize().padding(pad).padding(16.dp).verticalScroll(rememberScrollState())
         ) {
-            OutlinedTextField(
-                value = name, onValueChange = { name = it },
-                label = { Text("Görünecek ad") }, singleLine = true, modifier = Modifier.fillMaxWidth()
-            )
+            Text("Profil", fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.clickable { avatarPicker.launch("image/*") }) {
+                    AvatarB64(b64 = avatar, fallback = name.take(1).uppercase().ifBlank { "?" }, size = 72.dp)
+                    Surface(
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(24.dp).align(Alignment.BottomEnd)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(Icons.Filled.PhotoCamera, "Fotoğraf seç", Modifier.size(15.dp), tint = MaterialTheme.colorScheme.onPrimary)
+                        }
+                    }
+                }
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    OutlinedTextField(
+                        value = name, onValueChange = { name = it },
+                        label = { Text("Görünecek ad") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = bio, onValueChange = { bio = it },
+                        label = { Text("Hakkımda (bio)") }, maxLines = 3, modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = {
+                    if (name.isNotBlank()) Repo.setDisplayName(name.trim())
+                    Repo.setProfile(avatar, bio.trim())
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("Profili kaydet ve yayınla") }
 
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(24.dp))
+            Text("Tema", fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
+            com.gizli.messenger.ui.themeOptions.forEach { opt ->
+                Row(
+                    Modifier.fillMaxWidth().clickable { Repo.setTheme(opt.id) }.padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        if (settings?.theme == opt.id) Icons.Filled.Check else Icons.Filled.Edit,
+                        null, Modifier.size(18.dp),
+                        tint = if (settings?.theme == opt.id) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text(opt.label, fontWeight = if (settings?.theme == opt.id) FontWeight.SemiBold else FontWeight.Normal)
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Ekran görüntüsünü engelle", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Açıkken ekran görüntüsü ve kayıt engellenir (FLAG_SECURE).",
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = settings?.secureScreen == true,
+                    onCheckedChange = { Repo.setSecureScreen(it) }
+                )
+            }
+
+            Spacer(Modifier.height(24.dp))
             Text("Aktarma yöntemi", fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
             Row {
@@ -844,19 +1133,214 @@ private fun UpdateScreen(onBack: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun GroupInfoScreen(
+    group: Group,
+    contacts: List<Contact>,
+    myId: String,
+    onBack: () -> Unit,
+    onUpdate: (String, String) -> Unit,
+    onAddMembers: (List<String>) -> Unit,
+    onRemoveMember: (String) -> Unit,
+    onDelete: () -> Unit
+) {
+    val context = LocalContext.current
+    var name by remember { mutableStateOf(group.name) }
+    var avatar by remember { mutableStateOf(group.avatarB64) }
+    var showAdd by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+
+    val avatarPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            val b64 = compressAvatarToBase64(context, uri)
+            if (b64 != null) {
+                avatar = b64
+                onUpdate(name, b64)
+            }
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Grup bilgisi") },
+                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "Geri") } },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface)
+            )
+        }
+    ) { pad ->
+        Column(
+            Modifier.fillMaxSize().padding(pad).padding(16.dp).verticalScroll(rememberScrollState())
+        ) {
+            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                Box(Modifier.clickable { avatarPicker.launch("image/*") }) {
+                    AvatarB64(b64 = avatar, fallback = name.take(1).uppercase().ifBlank { "G" }, size = 96.dp)
+                    Surface(
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(28.dp).align(Alignment.BottomEnd)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(Icons.Filled.PhotoCamera, "Grup fotoğrafı", Modifier.size(16.dp), tint = MaterialTheme.colorScheme.onPrimary)
+                        }
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text("Grup fotoğrafını değiştir", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+
+            Spacer(Modifier.height(16.dp))
+            OutlinedTextField(
+                value = name, onValueChange = { name = it },
+                label = { Text("Grup adı") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            Button(onClick = { onUpdate(name, avatar) }, modifier = Modifier.fillMaxWidth()) {
+                Text("Grubu kaydet ve yayınla")
+            }
+
+            Spacer(Modifier.height(24.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Üyeler (${group.members.size})", fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                OutlinedButton(onClick = { showAdd = true }) {
+                    Icon(Icons.Filled.PersonAdd, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Üye ekle")
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            group.members.forEach { m ->
+                Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    AvatarB64(
+                        b64 = contacts.firstOrNull { it.userId == m.userId }?.avatarB64
+                            ?: if (m.userId == myId) Repo.identity.value?.avatarB64 ?: "" else "",
+                        fallback = m.name.take(1).uppercase().ifBlank { "?" },
+                        size = 40.dp
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(m.name + if (m.userId == myId) " (sen)" else "", modifier = Modifier.weight(1f))
+                    if (m.userId != myId) {
+                        IconButton(onClick = { onRemoveMember(m.userId) }) {
+                            Icon(Icons.Filled.Close, "Çıkar", tint = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                }
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+            }
+
+            Spacer(Modifier.height(24.dp))
+            if (!confirmDelete) {
+                OutlinedButton(onClick = { confirmDelete = true }, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.Delete, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp))
+                    Text("Gruptan ayrıl / sil")
+                }
+            } else {
+                Text("Grubu silersen bu grup cihazından kaldırılır.", color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+                Spacer(Modifier.height(8.dp))
+                Row {
+                    OutlinedButton(onClick = { confirmDelete = false }) { Text("Vazgeç") }
+                    Spacer(Modifier.width(8.dp))
+                    Button(onClick = onDelete) { Text("Evet, sil") }
+                }
+            }
+        }
+    }
+
+    if (showAdd) {
+        val memberIds = group.members.map { it.userId }.toSet()
+        val candidates = contacts.filter { !memberIds.contains(it.userId) }
+        AddMembersDialog(
+            candidates = candidates,
+            onDismiss = { showAdd = false },
+            onConfirm = { ids -> onAddMembers(ids); showAdd = false }
+        )
+    }
+}
+
+@Composable
+private fun AddMembersDialog(
+    candidates: List<Contact>,
+    onDismiss: () -> Unit,
+    onConfirm: (List<String>) -> Unit
+) {
+    val selected = remember { mutableStateOf(setOf<String>()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Üye ekle") },
+        text = {
+            if (candidates.isEmpty()) {
+                Text("Eklenecek yeni kişi yok.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+            } else {
+                Column(Modifier.heightIn(max = 320.dp).verticalScroll(rememberScrollState())) {
+                    candidates.forEach { c ->
+                        Row(
+                            Modifier.fillMaxWidth().clickable {
+                                selected.value = if (selected.value.contains(c.userId))
+                                    selected.value - c.userId else selected.value + c.userId
+                            }.padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = selected.value.contains(c.userId),
+                                onCheckedChange = { on ->
+                                    selected.value = if (on) selected.value + c.userId else selected.value - c.userId
+                                }
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(c.name)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(selected.value.toList()) },
+                enabled = selected.value.isNotEmpty()
+            ) { Text("Ekle") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Vazgeç") } }
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CreateGroupDialog(
     contacts: List<Contact>,
     onDismiss: () -> Unit,
-    onCreate: (String, List<String>) -> Unit
+    onCreate: (String, List<String>, String) -> Unit
 ) {
+    val context = LocalContext.current
     var name by remember { mutableStateOf("") }
+    var avatar by remember { mutableStateOf("") }
     val selected = remember { mutableStateOf(setOf<String>()) }
+    val avatarPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            val b64 = compressAvatarToBase64(context, uri)
+            if (b64 != null) avatar = b64
+        }
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Yeni grup") },
         text = {
             Column {
+                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Box(Modifier.clickable { avatarPicker.launch("image/*") }) {
+                        AvatarB64(b64 = avatar, fallback = name.take(1).uppercase().ifBlank { "G" }, size = 72.dp)
+                        Surface(
+                            shape = CircleShape,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(24.dp).align(Alignment.BottomEnd)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(Icons.Filled.PhotoCamera, "Grup fotoğrafı", Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onPrimary)
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text("Grup fotoğrafı (isteğe bağlı)", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
@@ -895,7 +1379,7 @@ private fun CreateGroupDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { onCreate(name.trim(), selected.value.toList()) },
+                onClick = { onCreate(name.trim(), selected.value.toList(), avatar) },
                 enabled = name.isNotBlank()
             ) { Text("Oluştur") }
         },
