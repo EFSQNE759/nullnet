@@ -22,10 +22,27 @@ data class Message(
     val outgoing: Boolean,
     val text: String,
     val ts: Long,
-    val status: MessageStatus
+    val status: MessageStatus,
+    val type: String = "text",
+    val groupId: String = "",
+    val senderId: String = ""
 )
 
 enum class MessageStatus { PENDING, SENT, DELIVERED, FAILED }
+
+data class GroupMember(
+    val userId: String,
+    val publicKey: String,
+    val name: String
+)
+
+data class Group(
+    val id: String,
+    val name: String,
+    val keyB64: String,
+    val members: List<GroupMember>,
+    val createdAt: Long
+)
 
 data class Settings(
     val relay: String,

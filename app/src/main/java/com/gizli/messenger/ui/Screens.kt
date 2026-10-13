@@ -2,7 +2,11 @@ package com.gizli.messenger.ui
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -13,11 +17,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -30,12 +36,16 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
@@ -63,6 +73,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -72,6 +84,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.gizli.messenger.BuildConfig
 import com.gizli.messenger.data.Contact
+import com.gizli.messenger.data.Group
 import com.gizli.messenger.data.Message
 import com.gizli.messenger.data.MessageStatus
 import com.gizli.messenger.data.Repo
@@ -80,6 +93,7 @@ import com.gizli.messenger.update.UpdateInfo
 import com.gizli.messenger.update.UpdateManager
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -97,10 +111,12 @@ fun GizliApp() {
     val context = LocalContext.current
     val identity by Repo.identity.collectAsState()
     val contacts by Repo.contacts.collectAsState()
+    val groups by Repo.groups.collectAsState()
     val settings by Repo.settings.collectAsState()
     val allMessages by Repo.messages.collectAsState()
 
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
+    var showCreateGroup by remember { mutableStateOf(false) }
 
     // Ön plan bağlantısı: MQTT ise sürekli açık tut, relay ise sık yokla
     LaunchedEffect(identity, settings) {
@@ -134,19 +150,37 @@ fun GizliApp() {
                 when (val s = screen) {
                     is Screen.Home -> HomeScreen(
                         contacts = contacts,
+                        groups = groups,
                         allMessages = allMessages,
                         onOpen = { screen = Screen.Chat(it) },
                         onAdd = { screen = Screen.Add },
                         onSettings = { screen = Screen.Settings },
-                        onUpdate = { screen = Screen.Update }
+                        onUpdate = { screen = Screen.Update },
+                        onNewGroup = { showCreateGroup = true }
                     )
 
-                    is Screen.Chat -> ChatScreen(
-                        contact = Repo.contactById(s.contactId),
-                        messages = allMessages[s.contactId].orEmpty(),
-                        onBack = { screen = Screen.Home },
-                        onSend = { Repo.sendMessage(s.contactId, it) }
-                    )
+                    is Screen.Chat -> {
+                        val chatId = s.contactId
+                        val group = Repo.groupById(chatId)
+                        val contact = Repo.contactById(chatId)
+                        ChatScreen(
+                            title = group?.name ?: contact?.name ?: "Sohbet",
+                            isGroup = group != null,
+                            messages = allMessages[chatId].orEmpty(),
+                            nameOf = { uid ->
+                                if (uid == Repo.identity.value?.userId) "Sen"
+                                else Repo.contactById(uid)?.name ?: uid.take(8)
+                            },
+                            onBack = { screen = Screen.Home },
+                            onSend = { t ->
+                                if (group != null) Repo.sendGroupMessage(chatId, t) else Repo.sendMessage(chatId, t)
+                            },
+                            onSendImage = { b64 ->
+                                if (group != null) Repo.sendGroupMessage(chatId, b64, "image")
+                                else Repo.sendMessage(chatId, b64, "image")
+                            }
+                        )
+                    }
 
                     Screen.Add -> AddContactScreen(onBack = { screen = Screen.Home })
 
@@ -156,6 +190,17 @@ fun GizliApp() {
                     )
 
                     Screen.Update -> UpdateScreen(onBack = { screen = Screen.Home })
+                }
+
+                if (showCreateGroup) {
+                    CreateGroupDialog(
+                        contacts = contacts,
+                        onDismiss = { showCreateGroup = false },
+                        onCreate = { gname, ids ->
+                            Repo.createGroup(gname, ids)
+                            showCreateGroup = false
+                        }
+                    )
                 }
             }
         }
@@ -205,11 +250,13 @@ private fun Onboarding(onDone: (String) -> Unit) {
 @Composable
 private fun HomeScreen(
     contacts: List<Contact>,
+    groups: List<Group>,
     allMessages: Map<String, List<Message>>,
     onOpen: (String) -> Unit,
     onAdd: () -> Unit,
     onSettings: () -> Unit,
-    onUpdate: () -> Unit
+    onUpdate: () -> Unit,
+    onNewGroup: () -> Unit
 ) {
     Scaffold(
         topBar = {
@@ -217,6 +264,7 @@ private fun HomeScreen(
                 title = { Text("nullnet") },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
                 actions = {
+                    IconButton(onClick = onNewGroup) { Icon(Icons.Filled.Group, "Yeni grup") }
                     IconButton(onClick = onUpdate) { Icon(Icons.Filled.SystemUpdate, "Güncelleme") }
                     IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, "Ayarlar") }
                 }
@@ -233,7 +281,7 @@ private fun HomeScreen(
             }
         }
     ) { pad ->
-        if (contacts.isEmpty()) {
+        if (contacts.isEmpty() && groups.isEmpty()) {
             Column(
                 Modifier.fillMaxSize().padding(pad).padding(32.dp),
                 verticalArrangement = Arrangement.Center,
@@ -248,18 +296,64 @@ private fun HomeScreen(
             }
         } else {
             LazyColumn(Modifier.fillMaxSize().padding(pad)) {
-                items(contacts, key = { it.userId }) { c ->
-                    val last = allMessages[c.userId]?.lastOrNull()
-                    ContactRow(c, last, onClick = { onOpen(c.userId) })
-                    HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                if (groups.isNotEmpty()) {
+                    item { SectionHeader("Gruplar") }
+                    items(groups, key = { it.id }) { g ->
+                        val last = allMessages[g.id]?.lastOrNull()
+                        ConversationRow(
+                            title = g.name,
+                            subtitle = preview(last),
+                            avatarText = g.name.take(1).uppercase(),
+                            isGroup = true,
+                            onClick = { onOpen(g.id) }
+                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                    }
+                }
+                if (contacts.isNotEmpty()) {
+                    item { SectionHeader("Kişiler") }
+                    items(contacts, key = { it.userId }) { c ->
+                        val last = allMessages[c.userId]?.lastOrNull()
+                        ConversationRow(
+                            title = c.name,
+                            subtitle = preview(last) ?: (c.userId.take(12) + "…"),
+                            avatarText = c.name.take(1).uppercase(),
+                            isGroup = false,
+                            onClick = { onOpen(c.userId) }
+                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                    }
                 }
             }
         }
     }
 }
 
+private fun preview(last: Message?): String? {
+    if (last == null) return null
+    val body = if (last.type == "image") "📷 Fotoğraf" else last.text
+    return (if (last.outgoing) "Sen: " else "") + body
+}
+
 @Composable
-private fun ContactRow(c: Contact, last: Message?, onClick: () -> Unit) {
+private fun SectionHeader(title: String) {
+    Text(
+        title,
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+        fontWeight = FontWeight.Bold,
+        fontSize = 13.sp,
+        color = MaterialTheme.colorScheme.primary
+    )
+}
+
+@Composable
+private fun ConversationRow(
+    title: String,
+    subtitle: String?,
+    avatarText: String,
+    isGroup: Boolean,
+    onClick: () -> Unit
+) {
     Row(
         Modifier.fillMaxWidth().clickable(onClick = onClick).padding(16.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -270,21 +364,25 @@ private fun ContactRow(c: Contact, last: Message?, onClick: () -> Unit) {
             modifier = Modifier.size(44.dp)
         ) {
             Box(contentAlignment = Alignment.Center) {
-                Text(c.name.take(1).uppercase(), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                Text(avatarText, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
             }
         }
         Spacer(Modifier.width(12.dp))
         Column(Modifier.fillMaxWidth()) {
-            Text(c.name, fontWeight = FontWeight.SemiBold)
-            if (last != null) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (isGroup) {
+                    Icon(Icons.Filled.Group, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.width(4.dp))
+                }
+                Text(title, fontWeight = FontWeight.SemiBold)
+            }
+            if (subtitle != null) {
                 Text(
-                    (if (last.outgoing) "Sen: " else "") + last.text,
+                    subtitle,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     fontSize = 13.sp
                 )
-            } else {
-                Text(c.userId.take(12) + "…", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 12.sp)
             }
         }
     }
@@ -293,20 +391,30 @@ private fun ContactRow(c: Contact, last: Message?, onClick: () -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ChatScreen(
-    contact: Contact?,
+    title: String,
+    isGroup: Boolean,
     messages: List<Message>,
+    nameOf: (String) -> String,
     onBack: () -> Unit,
-    onSend: (String) -> Unit
+    onSend: (String) -> Unit,
+    onSendImage: (String) -> Unit
 ) {
+    val context = LocalContext.current
     var text by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            val b64 = compressImageToBase64(context, uri)
+            if (b64 != null) onSendImage(b64)
+        }
+    }
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
     }
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(contact?.name ?: "Sohbet") },
+                title = { Text(title) },
                 navigationIcon = {
                     IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "Geri") }
                 },
@@ -320,12 +428,20 @@ private fun ChatScreen(
                 modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                items(messages, key = { it.id }) { m -> MessageBubble(m) }
+                items(messages, key = { it.id }) { m ->
+                    MessageBubble(
+                        m = m,
+                        senderName = if (isGroup && !m.outgoing) nameOf(m.senderId) else null
+                    )
+                }
             }
             Row(
                 Modifier.fillMaxWidth().navigationBarsPadding().padding(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                IconButton(onClick = { picker.launch("image/*") }) {
+                    Icon(Icons.Filled.Image, "Fotoğraf", tint = MaterialTheme.colorScheme.primary)
+                }
                 OutlinedTextField(
                     value = text,
                     onValueChange = { text = it },
@@ -344,15 +460,28 @@ private fun ChatScreen(
 }
 
 @Composable
-private fun MessageBubble(m: Message) {
+private fun MessageBubble(m: Message, senderName: String?) {
     val isOut = m.outgoing
     val bubbleColor = if (isOut) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
     else MaterialTheme.colorScheme.surfaceVariant
     val align = if (isOut) Alignment.CenterEnd else Alignment.CenterStart
     Box(Modifier.fillMaxWidth(), contentAlignment = align) {
         Column(horizontalAlignment = if (isOut) Alignment.End else Alignment.Start) {
+            if (senderName != null) {
+                Text(
+                    senderName,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                )
+            }
             Surface(color = bubbleColor, shape = RoundedCornerShape(14.dp)) {
-                Text(m.text, Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+                if (m.type == "image") {
+                    ImageBubble(m.text)
+                } else {
+                    Text(m.text, Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+                }
             }
             Text(
                 timeText(m.ts) + statusSuffix(m),
@@ -361,6 +490,46 @@ private fun MessageBubble(m: Message) {
                 modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
             )
         }
+    }
+}
+
+@Composable
+private fun ImageBubble(b64: String) {
+    val bmp = remember(b64) {
+        runCatching {
+            val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }.getOrNull()
+    }
+    if (bmp != null) {
+        Image(
+            bitmap = bmp.asImageBitmap(),
+            contentDescription = null,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.widthIn(max = 240.dp).heightIn(max = 320.dp).padding(4.dp)
+        )
+    } else {
+        Text("[fotoğraf]", Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
+    }
+}
+
+/** Seçilen görseli en fazla ~1280px olacak şekilde küçültüp JPEG base64 döndürür. */
+private fun compressImageToBase64(context: Context, uri: Uri): String? {
+    return try {
+        val cr = context.contentResolver
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        cr.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, bounds) }
+        var sample = 1
+        val maxDim = maxOf(bounds.outWidth, bounds.outHeight)
+        while (maxDim / sample > 1280) sample *= 2
+        val opts = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+        val bmp = cr.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it, null, opts) }
+            ?: return null
+        val out = ByteArrayOutputStream()
+        bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 65, out)
+        android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+    } catch (e: Exception) {
+        null
     }
 }
 
@@ -673,6 +842,65 @@ private fun UpdateScreen(onBack: () -> Unit) {
             }
         }
     }
+}
+
+@Composable
+private fun CreateGroupDialog(
+    contacts: List<Contact>,
+    onDismiss: () -> Unit,
+    onCreate: (String, List<String>) -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    val selected = remember { mutableStateOf(setOf<String>()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Yeni grup") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Grup adı") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(12.dp))
+                if (contacts.isEmpty()) {
+                    Text("Önce kişi eklemelisin.", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 13.sp)
+                } else {
+                    Text("Üyeler", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Column(Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())) {
+                        contacts.forEach { c ->
+                            Row(
+                                Modifier.fillMaxWidth().clickable {
+                                    selected.value = if (selected.value.contains(c.userId))
+                                        selected.value - c.userId else selected.value + c.userId
+                                }.padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = selected.value.contains(c.userId),
+                                    onCheckedChange = { on ->
+                                        selected.value = if (on) selected.value + c.userId else selected.value - c.userId
+                                    }
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(c.name)
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onCreate(name.trim(), selected.value.toList()) },
+                enabled = name.isNotBlank()
+            ) { Text("Oluştur") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Vazgeç") } }
+    )
 }
 
 private fun shareText(context: Context, text: String) {

@@ -44,17 +44,20 @@ object Repo {
     private val _identity = MutableStateFlow<Identity?>(null)
     private val _contacts = MutableStateFlow<List<Contact>>(emptyList())
     private val _messages = MutableStateFlow<Map<String, List<Message>>>(emptyMap())
+    private val _groups = MutableStateFlow<List<Group>>(emptyList())
     private val _settings = MutableStateFlow<Settings?>(null)
 
     val ready: StateFlow<Boolean> = _ready
     val identity: StateFlow<Identity?> = _identity
     val contacts: StateFlow<List<Contact>> = _contacts
     val messages: StateFlow<Map<String, List<Message>>> = _messages
+    val groups: StateFlow<List<Group>> = _groups
     val settings: StateFlow<Settings?> = _settings
 
     private val idFile get() = File(ctx.filesDir, "identity.json.enc")
     private val contactsFile get() = File(ctx.filesDir, "contacts.json.enc")
     private val messagesFile get() = File(ctx.filesDir, "messages.json.enc")
+    private val groupsFile get() = File(ctx.filesDir, "groups.json.enc")
     private val settingsFile get() = File(ctx.filesDir, "settings.json.enc")
 
     fun init(context: Context) {
@@ -64,6 +67,7 @@ object Repo {
         _settings.value = SecureStore.readSecureString(settingsFile)?.let(::parseSettings) ?: defaultSettings()
         _contacts.value = SecureStore.readSecureString(contactsFile)?.let(::parseContacts) ?: emptyList()
         _messages.value = SecureStore.readSecureString(messagesFile)?.let(::parseMessages) ?: emptyMap()
+        _groups.value = SecureStore.readSecureString(groupsFile)?.let(::parseGroups) ?: emptyList()
         persistIdentity()
         persistSettings()
         _ready.value = true
@@ -254,13 +258,137 @@ object Repo {
         persistContacts(); persistMessages()
     }
 
+    // ---------------- Gruplar ----------------
+
+    fun groupById(id: String): Group? = _groups.value.firstOrNull { it.id == id }
+
+    private fun upsertGroup(g: Group) {
+        val list = _groups.value.toMutableList()
+        val idx = list.indexOfFirst { it.id == g.id }
+        if (idx >= 0) list[idx] = g else list.add(g)
+        _groups.value = list
+        persistGroups()
+    }
+
+    private fun persistGroups() {
+        val arr = JSONArray()
+        for (g in _groups.value) {
+            arr.put(groupToJson(g))
+        }
+        SecureStore.writeSecureString(groupsFile, arr.toString())
+    }
+
+    private fun groupToJson(g: Group): JSONObject {
+        val members = JSONArray()
+        for (m in g.members) {
+            members.put(JSONObject().put("u", m.userId).put("k", m.publicKey).put("n", m.name))
+        }
+        return JSONObject()
+            .put("id", g.id)
+            .put("name", g.name)
+            .put("key", g.keyB64)
+            .put("members", members)
+            .put("createdAt", g.createdAt)
+    }
+
+    private fun groupFromJson(o: JSONObject): Group {
+        val members = ArrayList<GroupMember>()
+        val arr = o.optJSONArray("members") ?: JSONArray()
+        for (i in 0 until arr.length()) {
+            val m = arr.getJSONObject(i)
+            members.add(GroupMember(m.getString("u"), m.optString("k", ""), m.optString("n", "Isimsiz")))
+        }
+        return Group(
+            id = o.getString("id"),
+            name = o.optString("name", "Grup"),
+            keyB64 = o.optString("key", ""),
+            members = members,
+            createdAt = o.optLong("createdAt", System.currentTimeMillis())
+        )
+    }
+
+    private fun parseGroups(s: String): List<Group> {
+        val arr = JSONArray(s)
+        return (0 until arr.length()).map { groupFromJson(arr.getJSONObject(it)) }
+    }
+
+    /** Grup kurar, anahtarı her üyeye 1:1 E2E kanalından gönderir. */
+    fun createGroup(name: String, memberIds: List<String>): Group {
+        val me = _identity.value!!
+        val key = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+        val members = ArrayList<GroupMember>()
+        members.add(GroupMember(me.userId, me.encPublic, me.displayName))
+        for (id in memberIds) {
+            val c = contactById(id) ?: continue
+            members.add(GroupMember(c.userId, c.publicKey, c.name))
+        }
+        val group = Group(
+            id = "g_" + UUID.randomUUID().toString().replace("-", "").take(12),
+            name = name.trim().ifBlank { "Grup" },
+            keyB64 = B64.enc(key),
+            members = members,
+            createdAt = System.currentTimeMillis()
+        )
+        upsertGroup(group)
+        scope.launch {
+            val invite = JSONObject()
+                .put("type", "group_invite")
+                .put("from", me.userId)
+                .put("name", me.displayName)
+                .put("group", groupToJson(group))
+                .toString()
+            for (m in group.members) {
+                if (m.userId == me.userId) continue
+                val c = contactById(m.userId) ?: Contact(m.userId, m.publicKey, m.name, _settings.value!!.relay, System.currentTimeMillis(), false)
+                transmitWithRetry(c, invite, Crypto.INFO_MSG)
+            }
+        }
+        return group
+    }
+
+    fun removeGroup(id: String) {
+        _groups.value = _groups.value.filterNot { it.id == id }
+        _messages.value = _messages.value.toMutableMap().also { it.remove(id) }
+        persistGroups(); persistMessages()
+    }
+
+    fun sendGroupMessage(groupId: String, content: String, type: String = "text") {
+        val group = groupById(groupId) ?: return
+        if (content.isBlank()) return
+        val me = _identity.value!!
+        val msgId = UUID.randomUUID().toString()
+        val ts = System.currentTimeMillis()
+        appendMessage(Message(msgId, groupId, true, content, ts, MessageStatus.PENDING, type, groupId, me.userId))
+        scope.launch {
+            val inner = JSONObject()
+                .put("type", "group_msg")
+                .put("from", me.userId)
+                .put("name", me.displayName)
+                .put("gid", groupId)
+                .put("gname", group.name)
+                .put("mtype", type)
+                .put("body", content)
+                .put("ts", ts)
+                .put("id", msgId)
+                .toString()
+            var anyOk = false
+            for (m in group.members) {
+                if (m.userId == me.userId) continue
+                val c = contactById(m.userId) ?: Contact(m.userId, m.publicKey, m.name, _settings.value!!.relay, System.currentTimeMillis(), false)
+                if (transmitWithRetry(c, inner, Crypto.INFO_MSG)) anyOk = true
+            }
+            updateStatus(msgId, if (anyOk) MessageStatus.SENT else MessageStatus.FAILED)
+        }
+    }
+
     /** Tüm yerel verileri siler ve yeni bir anonim kimlik üretir. */
     fun wipeAll() {
-        idFile.delete(); contactsFile.delete(); messagesFile.delete(); settingsFile.delete()
+        idFile.delete(); contactsFile.delete(); messagesFile.delete(); settingsFile.delete(); groupsFile.delete()
         _identity.value = newIdentity()
         _settings.value = defaultSettings()
         _contacts.value = emptyList()
         _messages.value = emptyMap()
+        _groups.value = emptyList()
         persistIdentity(); persistSettings(); persistContacts(); persistMessages()
     }
 
@@ -299,6 +427,9 @@ object Repo {
                         .put("text", m.text)
                         .put("ts", m.ts)
                         .put("status", m.status.name)
+                        .put("type", m.type)
+                        .put("groupId", m.groupId)
+                        .put("senderId", m.senderId)
                 )
             }
             root.put(contactId, arr)
@@ -319,21 +450,24 @@ object Repo {
                     o.getBoolean("outgoing"),
                     o.getString("text"),
                     o.getLong("ts"),
-                    MessageStatus.valueOf(o.optString("status", "SENT"))
+                    MessageStatus.valueOf(o.optString("status", "SENT")),
+                    o.optString("type", "text"),
+                    o.optString("groupId", ""),
+                    o.optString("senderId", "")
                 )
             }
         }
         return out
     }
 
-    fun sendMessage(contactId: String, text: String) {
+    fun sendMessage(contactId: String, text: String, type: String = "text") {
         val contact = contactById(contactId) ?: return
         if (text.isBlank()) return
         val msgId = UUID.randomUUID().toString()
         val ts = System.currentTimeMillis()
-        appendMessage(Message(msgId, contactId, true, text, ts, MessageStatus.PENDING))
+        appendMessage(Message(msgId, contactId, true, text, ts, MessageStatus.PENDING, type, "", _identity.value!!.userId))
         scope.launch {
-            val inner = innerMessage(contact, text, ts, msgId)
+            val inner = innerMessage(contact, text, ts, msgId, type)
             val isMqtt = _settings.value?.transport == "mqtt"
 
             var ok = transmit(contact, inner, Crypto.INFO_MSG)
@@ -355,16 +489,31 @@ object Repo {
         }
     }
 
-    private fun innerMessage(contact: Contact, text: String, ts: Long, msgId: String): String {
+    private fun innerMessage(contact: Contact, text: String, ts: Long, msgId: String, type: String): String {
         val i = _identity.value!!
         return JSONObject()
             .put("type", "msg")
             .put("from", i.userId)
             .put("name", i.displayName)
+            .put("mtype", type)
             .put("body", text)
             .put("ts", ts)
             .put("id", msgId)
             .toString()
+    }
+
+    /** Bir iç mesajı E2E şifreleyip gönderir; MQTT'de kopmuşsa yeniden bağlanıp dener. */
+    private suspend fun transmitWithRetry(contact: Contact, inner: String, info: ByteArray): Boolean {
+        var ok = transmit(contact, inner, info)
+        if (!ok && _settings.value?.transport == "mqtt") {
+            for (i in 0 until 4) {
+                connectMqtt()
+                delay(2000)
+                ok = transmit(contact, inner, info)
+                if (ok) break
+            }
+        }
+        return ok
     }
 
     private fun sendHello(contact: Contact) {
@@ -504,11 +653,56 @@ object Repo {
         }
 
         val type = o.optString("type", "msg")
-        if (type == "msg") {
-            val msgId = o.optString("id", UUID.randomUUID().toString())
-            if (messagesFor(from).any { it.id == msgId }) return false
-            appendMessage(Message(msgId, from, false, o.optString("body", ""), o.optLong("ts", System.currentTimeMillis()), MessageStatus.DELIVERED))
-            return true
+        when (type) {
+            "group_invite" -> {
+                val g = o.optJSONObject("group") ?: return false
+                val incoming = groupFromJson(g)
+                val prev = groupById(incoming.id)
+                // Mevcut üye anahtarları varsa koru; gelen tanım daha günceldir.
+                upsertGroup(incoming)
+                return prev == null
+            }
+            "group_msg" -> {
+                val gid = o.optString("gid", "")
+                if (gid.isEmpty()) return false
+                if (groupById(gid) == null) {
+                    val me = _identity.value!!
+                    upsertGroup(
+                        Group(
+                            id = gid,
+                            name = o.optString("gname", "Grup"),
+                            keyB64 = "",
+                            members = listOf(
+                                GroupMember(me.userId, me.encPublic, me.displayName),
+                                GroupMember(from, senderPubB64, name)
+                            ),
+                            createdAt = System.currentTimeMillis()
+                        )
+                    )
+                }
+                val msgId = o.optString("id", UUID.randomUUID().toString())
+                if (messagesFor(gid).any { it.id == msgId }) return false
+                appendMessage(
+                    Message(
+                        msgId, gid, false, o.optString("body", ""),
+                        o.optLong("ts", System.currentTimeMillis()), MessageStatus.DELIVERED,
+                        o.optString("mtype", "text"), gid, from
+                    )
+                )
+                return true
+            }
+            "msg" -> {
+                val msgId = o.optString("id", UUID.randomUUID().toString())
+                if (messagesFor(from).any { it.id == msgId }) return false
+                appendMessage(
+                    Message(
+                        msgId, from, false, o.optString("body", ""),
+                        o.optLong("ts", System.currentTimeMillis()), MessageStatus.DELIVERED,
+                        o.optString("mtype", "text"), "", from
+                    )
+                )
+                return true
+            }
         }
         // hello: yeni kişi eklendi, mesaj sayılmaz
         return existing == null
