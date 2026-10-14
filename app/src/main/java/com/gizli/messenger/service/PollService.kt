@@ -58,6 +58,9 @@ class PollService : Service() {
         Repo.init(applicationContext)
         scope.launch {
             Repo.onNewMessage = { n -> notifyNewMessages(n) }
+            // Depolama yüklenene kadar bekle (init artık arka planda çalışıyor).
+            var waited = 0
+            while (isActive && !Repo.ready.value && waited < 15000) { delay(200); waited += 200 }
             if (Repo.settings.value?.transport == "mqtt") {
                 // Hazır broker: bağlantıyı sürekli açık tut
                 Repo.connectMqtt()

@@ -67,18 +67,29 @@ object Repo {
     private val groupsFile get() = File(ctx.filesDir, "groups.json.enc")
     private val settingsFile get() = File(ctx.filesDir, "settings.json.enc")
 
+    @Volatile
+    private var started = false
+
     fun init(context: Context) {
-        if (_ready.value) return
+        if (started) return
+        started = true
         ctx = context.applicationContext
-        _identity.value = SecureStore.readSecureString(idFile)?.let(::parseIdentity) ?: newIdentity()
-        _settings.value = SecureStore.readSecureString(settingsFile)?.let(::parseSettings) ?: defaultSettings()
-        _contacts.value = SecureStore.readSecureString(contactsFile)?.let(::parseContacts) ?: emptyList()
-        _messages.value = SecureStore.readSecureString(messagesFile)?.let(::parseMessages) ?: emptyMap()
-        _groups.value = SecureStore.readSecureString(groupsFile)?.let(::parseGroups) ?: emptyList()
-        persistIdentity()
-        persistSettings()
-        if (_settings.value?.lockEnabled == true) _locked.value = true
-        _ready.value = true
+        // Ağır Keystore okuma/yazma işlemleri ana iş parçacığını bloklamasın:
+        // UI, kimlik hazır olana kadar yükleme ekranı gösterir (_ready / identity == null).
+        scope.launch {
+            val idStr = SecureStore.readSecureString(idFile)
+            _identity.value = idStr?.let(::parseIdentity) ?: newIdentity()
+            val setStr = SecureStore.readSecureString(settingsFile)
+            _settings.value = setStr?.let(::parseSettings) ?: defaultSettings()
+            _contacts.value = SecureStore.readSecureString(contactsFile)?.let(::parseContacts) ?: emptyList()
+            _messages.value = SecureStore.readSecureString(messagesFile)?.let(::parseMessages) ?: emptyMap()
+            _groups.value = SecureStore.readSecureString(groupsFile)?.let(::parseGroups) ?: emptyList()
+            // Yalnızca ilk oluşturmada yaz (her açılışta gereksiz şifreleme/yazma yapma).
+            if (idStr == null) persistIdentity()
+            if (setStr == null) persistSettings()
+            if (_settings.value?.lockEnabled == true) _locked.value = true
+            _ready.value = true
+        }
     }
 
     // ---------------- Kimlik ----------------
@@ -117,7 +128,12 @@ object Repo {
             .put("displayName", i.displayName)
             .put("avatarB64", i.avatarB64)
             .put("bio", i.bio)
-        SecureStore.writeSecureString(idFile, o.toString())
+        writeAsync(idFile, o.toString())
+    }
+
+    /** Ağır dosya yazma/işlemlerini ana iş parçacığından ayırır. */
+    private fun writeAsync(file: File, text: String) {
+        scope.launch { SecureStore.writeSecureString(file, text) }
     }
 
     private fun parseIdentity(s: String): Identity {
@@ -278,7 +294,7 @@ object Repo {
             .put("duressSalt", s.duressSalt)
             .put("biometricEnabled", s.biometricEnabled)
             .put("autoUpdate", s.autoUpdate)
-        SecureStore.writeSecureString(settingsFile, o.toString())
+        writeAsync(settingsFile, o.toString())
     }
 
     private fun parseSettings(s: String): Settings {
@@ -384,7 +400,7 @@ object Repo {
                     .put("bio", c.bio)
             )
         }
-        SecureStore.writeSecureString(contactsFile, arr.toString())
+        writeAsync(contactsFile, arr.toString())
     }
 
     private fun parseContacts(s: String): List<Contact> {
@@ -429,7 +445,7 @@ object Repo {
         for (g in _groups.value) {
             arr.put(groupToJson(g))
         }
-        SecureStore.writeSecureString(groupsFile, arr.toString())
+        writeAsync(groupsFile, arr.toString())
     }
 
     private fun groupToJson(g: Group): JSONObject {
@@ -725,32 +741,35 @@ object Repo {
     }
 
     private fun persistMessages() {
-        val root = JSONObject()
-        for ((contactId, list) in _messages.value) {
-            val arr = JSONArray()
-            for (m in list) {
-                arr.put(
-                    JSONObject()
-                        .put("id", m.id)
-                        .put("contactId", m.contactId)
-                        .put("outgoing", m.outgoing)
-                        .put("text", m.text)
-                        .put("ts", m.ts)
-                        .put("status", m.status.name)
-                        .put("type", m.type)
-                        .put("groupId", m.groupId)
-                        .put("senderId", m.senderId)
-                        .put("viewOnce", m.viewOnce)
-                        .put("viewed", m.viewed)
-                        .put("fileName", m.fileName)
-                        .put("replyToId", m.replyToId)
-                        .put("replyPreview", m.replyPreview)
-                        .put("reactions", reactionJson(m.reactions))
-                )
+        val snapshot = _messages.value
+        scope.launch {
+            val root = JSONObject()
+            for ((contactId, list) in snapshot) {
+                val arr = JSONArray()
+                for (m in list) {
+                    arr.put(
+                        JSONObject()
+                            .put("id", m.id)
+                            .put("contactId", m.contactId)
+                            .put("outgoing", m.outgoing)
+                            .put("text", m.text)
+                            .put("ts", m.ts)
+                            .put("status", m.status.name)
+                            .put("type", m.type)
+                            .put("groupId", m.groupId)
+                            .put("senderId", m.senderId)
+                            .put("viewOnce", m.viewOnce)
+                            .put("viewed", m.viewed)
+                            .put("fileName", m.fileName)
+                            .put("replyToId", m.replyToId)
+                            .put("replyPreview", m.replyPreview)
+                            .put("reactions", reactionJson(m.reactions))
+                    )
+                }
+                root.put(contactId, arr)
             }
-            root.put(contactId, arr)
+            SecureStore.writeSecureString(messagesFile, root.toString())
         }
-        SecureStore.writeSecureString(messagesFile, root.toString())
     }
 
     private fun parseMessages(s: String): Map<String, List<Message>> {

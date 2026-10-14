@@ -157,10 +157,34 @@ fun GizliApp() {
     val allMessages by Repo.messages.collectAsState()
     val locked by Repo.locked.collectAsState()
 
+    val scope = rememberCoroutineScope()
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     var showCreateGroup by remember { mutableStateOf(false) }
     var autoProgress by remember { mutableStateOf<Int?>(null) }
     var autoChecked by remember { mutableStateOf(false) }
+    var updatePrompt by remember { mutableStateOf<UpdateInfo?>(null) }
+
+    fun startUpdateDownload(info: UpdateInfo) {
+        val um = UpdateManager(context.applicationContext)
+        if (!um.canInstallPackages()) {
+            Toast.makeText(context, "Kurulum izni gerekli. Ayarlardan bu uygulamaya izin ver.", Toast.LENGTH_LONG).show()
+            um.openInstallPermissionSettings()
+            return
+        }
+        updatePrompt = null
+        scope.launch {
+            autoProgress = 0
+            val res = um.downloadApk(info) { p -> autoProgress = p }
+            autoProgress = null
+            res.fold(
+                onSuccess = { file ->
+                    Toast.makeText(context, "Güncelleme kuruluyor…", Toast.LENGTH_SHORT).show()
+                    um.install(file)
+                },
+                onFailure = { Toast.makeText(context, "Güncelleme hatası: ${it.message}", Toast.LENGTH_LONG).show() }
+            )
+        }
+    }
 
     // Ekran görüntüsü engeli (FLAG_SECURE)
     val secure = settings?.secureScreen ?: true
@@ -191,7 +215,7 @@ fun GizliApp() {
         }
     }
 
-    // Açılışta otomatik güncelleme: imzalı yeni sürüm varsa indir ve kur.
+    // Uygulamaya ilk girişte güncellemeyi kontrol et; varsa indirme bildirimi (diyalog) göster.
     LaunchedEffect(identity, locked, settings?.autoUpdate) {
         if (autoChecked) return@LaunchedEffect
         val me = identity ?: return@LaunchedEffect
@@ -201,25 +225,33 @@ fun GizliApp() {
         autoChecked = true
         val um = UpdateManager(context.applicationContext)
         val info = um.checkForUpdate().getOrNull() ?: return@LaunchedEffect
-        if (!um.canInstallPackages()) {
-            Toast.makeText(context, "Güncelleme (v${info.versionName}) hazır — kurulum izni ver.", Toast.LENGTH_LONG).show()
-            um.openInstallPermissionSettings()
-            return@LaunchedEffect
-        }
-        autoProgress = 0
-        val res = um.downloadApk(info) { p -> autoProgress = p }
-        autoProgress = null
-        res.fold(
-            onSuccess = { file ->
-                Toast.makeText(context, "Güncelleme kuruluyor…", Toast.LENGTH_SHORT).show()
-                um.install(file)
-            },
-            onFailure = { Toast.makeText(context, "Güncelleme hatası: ${it.message}", Toast.LENGTH_LONG).show() }
-        )
+        updatePrompt = info
     }
 
     GizliTheme(themeId = settings?.theme ?: "default") {
         val id = identity
+        updatePrompt?.let { info ->
+            AlertDialog(
+                onDismissRequest = { updatePrompt = null },
+                icon = { Icon(Icons.Filled.SystemUpdate, null, tint = MaterialTheme.colorScheme.primary) },
+                title = { Text("Yeni sürüm v${info.versionName}") },
+                text = {
+                    Column {
+                        Text("Yeni bir sürüm hazır. Şimdi indirip kurmak ister misin?")
+                        if (info.notes.isNotBlank()) {
+                            Spacer(Modifier.height(8.dp))
+                            Text(info.notes, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { startUpdateDownload(info) }) { Text("İndir") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { updatePrompt = null }) { Text("Daha sonra") }
+                }
+            )
+        }
         autoProgress?.let { p ->
             AlertDialog(
                 onDismissRequest = {},
@@ -1862,9 +1894,9 @@ private fun SettingsScreen(onBack: () -> Unit, onWiped: () -> Unit) {
             Spacer(Modifier.height(24.dp))
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("Açılışta otomatik güncelle", fontWeight = FontWeight.SemiBold)
+                    Text("Açılışta güncellemeyi kontrol et", fontWeight = FontWeight.SemiBold)
                     Text(
-                        "Uygulama açıldığında imzalı yeni sürümü otomatik indirir ve kurulum ekranını açar.",
+                        "Uygulamaya ilk girişte imzalı yeni sürüm varsa indirme bildirimi gösterilir.",
                         fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }

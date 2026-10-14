@@ -19,6 +19,9 @@ object SecureStore {
     private const val KEY_ALIAS = "gizli_master_key_v1"
     private const val GCM_TAG_BITS = 128
 
+    @Volatile
+    private var cachedKey: SecretKey? = null
+
     private fun keyStore(): KeyStore {
         val ks = KeyStore.getInstance(KEYSTORE)
         ks.load(null)
@@ -26,19 +29,27 @@ object SecureStore {
     }
 
     private fun getOrCreateKey(): SecretKey {
-        val ks = keyStore()
-        (ks.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry)?.let { return it.secretKey }
-        val kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE)
-        val spec = KeyGenParameterSpec.Builder(
-            KEY_ALIAS,
-            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-        )
-            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-            .setKeySize(256)
-            .build()
-        kg.init(spec)
-        return kg.generateKey()
+        cachedKey?.let { return it }
+        synchronized(this) {
+            cachedKey?.let { return it }
+            val ks = keyStore()
+            val key = (ks.getEntry(KEY_ALIAS, null) as? KeyStore.SecretKeyEntry)?.secretKey
+                ?: run {
+                    val kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE)
+                    val spec = KeyGenParameterSpec.Builder(
+                        KEY_ALIAS,
+                        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                    )
+                        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                        .setKeySize(256)
+                        .build()
+                    kg.init(spec)
+                    kg.generateKey()
+                }
+            cachedKey = key
+            return key
+        }
     }
 
     private fun encrypt(data: ByteArray): ByteArray {
