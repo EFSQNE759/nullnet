@@ -17,7 +17,8 @@ data class Contact(
     val addedAt: Long,
     val pending: Boolean = false,
     val avatarB64: String = "",
-    val bio: String = ""
+    val bio: String = "",
+    val muted: Boolean = false
 )
 
 data class Message(
@@ -52,7 +53,8 @@ data class Group(
     val keyB64: String,
     val members: List<GroupMember>,
     val createdAt: Long,
-    val avatarB64: String = ""
+    val avatarB64: String = "",
+    val muted: Boolean = false
 )
 
 data class Settings(

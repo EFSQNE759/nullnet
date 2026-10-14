@@ -60,6 +60,12 @@ object Repo {
 
     private val typingJobs = HashMap<String, kotlinx.coroutines.Job>()
     private val lastTypingSent = HashMap<String, Long>()
+    private val drafts = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    @Volatile
+    private var persistInFlight = false
+    @Volatile
+    private var persistPending = false
 
     private val idFile get() = File(ctx.filesDir, "identity.json.enc")
     private val contactsFile get() = File(ctx.filesDir, "contacts.json.enc")
@@ -398,6 +404,7 @@ object Repo {
                     .put("pending", c.pending)
                     .put("avatarB64", c.avatarB64)
                     .put("bio", c.bio)
+                    .put("muted", c.muted)
             )
         }
         writeAsync(contactsFile, arr.toString())
@@ -415,12 +422,41 @@ object Repo {
                 o.optLong("addedAt", 0),
                 o.optBoolean("pending", false),
                 o.optString("avatarB64", ""),
-                o.optString("bio", "")
+                o.optString("bio", ""),
+                o.optBoolean("muted", false)
             )
         }
     }
 
     fun contactById(id: String): Contact? = _contacts.value.firstOrNull { it.userId == id }
+
+    /** Bir sohbetteki okunmamış gelen mesaj sayısı. */
+    fun unreadCount(chatId: String): Int =
+        _messages.value[chatId].orEmpty().count { !it.outgoing && it.status != MessageStatus.READ }
+
+    fun setContactMuted(id: String, muted: Boolean) {
+        val list = _contacts.value.toMutableList()
+        val idx = list.indexOfFirst { it.userId == id }
+        if (idx < 0) return
+        list[idx] = list[idx].copy(muted = muted)
+        _contacts.value = list
+        persistContacts()
+    }
+
+    fun setGroupMuted(id: String, muted: Boolean) {
+        val list = _groups.value.toMutableList()
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        list[idx] = list[idx].copy(muted = muted)
+        _groups.value = list
+        persistGroups()
+    }
+
+    fun draftFor(chatId: String): String = drafts[chatId] ?: ""
+
+    fun setDraft(chatId: String, text: String) {
+        if (text.isBlank()) drafts.remove(chatId) else drafts[chatId] = text
+    }
 
     fun removeContact(id: String) {
         _contacts.value = _contacts.value.filterNot { it.userId == id }
@@ -460,6 +496,7 @@ object Repo {
             .put("members", members)
             .put("createdAt", g.createdAt)
             .put("avatar", g.avatarB64)
+            .put("muted", g.muted)
     }
 
     private fun groupFromJson(o: JSONObject): Group {
@@ -475,7 +512,8 @@ object Repo {
             keyB64 = o.optString("key", ""),
             members = members,
             createdAt = o.optLong("createdAt", System.currentTimeMillis()),
-            avatarB64 = o.optString("avatar", "")
+            avatarB64 = o.optString("avatar", ""),
+            muted = o.optBoolean("muted", false)
         )
     }
 
@@ -619,6 +657,8 @@ object Repo {
 
     /** Tüm verileri (kimlik dahil) parola ile şifreleyip yedek üretir. */
     fun exportBackup(password: String): ByteArray {
+        // Mesajlar debounce ile yazılır; yedek her zaman bellekteki güncel halini alır.
+        persistMessagesNow()
         val root = JSONObject()
         root.put("identity", SecureStore.readSecureString(idFile) ?: "")
         root.put("contacts", SecureStore.readSecureString(contactsFile) ?: "")
@@ -687,10 +727,20 @@ object Repo {
         persistMessages()
     }
 
-    private fun updateMessage(id: String, transform: (Message) -> Message) {
+    private fun updateMessage(id: String, transform: (Message) -> Message) =
+        updateMessages(setOf(id)) { m -> if (m.id == id) transform(m) else m }
+
+    /** Birden fazla mesajı tek geçişte günceller (toplu) — UI ve disk yazımı bir kez tetiklenir. */
+    private fun updateMessages(ids: Set<String>, transform: (Message) -> Message) {
+        if (ids.isEmpty()) return
         val map = _messages.value.toMutableMap()
-        val contactId = map.keys.firstOrNull { key -> map[key]!!.any { it.id == id } } ?: return
-        map[contactId] = map[contactId]!!.map { if (it.id == id) transform(it) else it }
+        var changed = false
+        for ((key, list) in map) {
+            if (list.none { ids.contains(it.id) }) continue
+            map[key] = list.map { if (ids.contains(it.id)) transform(it) else it }
+            changed = true
+        }
+        if (!changed) return
         _messages.value = map
         persistMessages()
     }
@@ -740,36 +790,58 @@ object Repo {
         }
     }
 
+    /** Mesaj deposunu diske yazar; art arda gelen tetiklemeleri birleştirir (debounce). */
     private fun persistMessages() {
-        val snapshot = _messages.value
+        persistPending = true
+        if (persistInFlight) return
         scope.launch {
-            val root = JSONObject()
-            for ((contactId, list) in snapshot) {
-                val arr = JSONArray()
-                for (m in list) {
-                    arr.put(
-                        JSONObject()
-                            .put("id", m.id)
-                            .put("contactId", m.contactId)
-                            .put("outgoing", m.outgoing)
-                            .put("text", m.text)
-                            .put("ts", m.ts)
-                            .put("status", m.status.name)
-                            .put("type", m.type)
-                            .put("groupId", m.groupId)
-                            .put("senderId", m.senderId)
-                            .put("viewOnce", m.viewOnce)
-                            .put("viewed", m.viewed)
-                            .put("fileName", m.fileName)
-                            .put("replyToId", m.replyToId)
-                            .put("replyPreview", m.replyPreview)
-                            .put("reactions", reactionJson(m.reactions))
-                    )
+            persistInFlight = true
+            try {
+                while (true) {
+                    delay(350)
+                    persistPending = false
+                    SecureStore.writeSecureString(messagesFile, messagesToJson(_messages.value).toString())
+                    if (!persistPending) break
                 }
-                root.put(contactId, arr)
+            } finally {
+                persistInFlight = false
             }
-            SecureStore.writeSecureString(messagesFile, root.toString())
         }
+    }
+
+    /** Yedek/alış için anlık (senkron) yazım — beklemedeki debounce'u beklemez. */
+    private fun persistMessagesNow() {
+        persistPending = false
+        SecureStore.writeSecureString(messagesFile, messagesToJson(_messages.value).toString())
+    }
+
+    private fun messagesToJson(snapshot: Map<String, List<Message>>): JSONObject {
+        val root = JSONObject()
+        for ((contactId, list) in snapshot) {
+            val arr = JSONArray()
+            for (m in list) {
+                arr.put(
+                    JSONObject()
+                        .put("id", m.id)
+                        .put("contactId", m.contactId)
+                        .put("outgoing", m.outgoing)
+                        .put("text", m.text)
+                        .put("ts", m.ts)
+                        .put("status", m.status.name)
+                        .put("type", m.type)
+                        .put("groupId", m.groupId)
+                        .put("senderId", m.senderId)
+                        .put("viewOnce", m.viewOnce)
+                        .put("viewed", m.viewed)
+                        .put("fileName", m.fileName)
+                        .put("replyToId", m.replyToId)
+                        .put("replyPreview", m.replyPreview)
+                        .put("reactions", reactionJson(m.reactions))
+                )
+            }
+            root.put(contactId, arr)
+        }
+        return root
     }
 
     private fun parseMessages(s: String): Map<String, List<Message>> {
@@ -926,15 +998,16 @@ object Repo {
         val list = messagesFor(chatId)
         val unread = list.filter { !it.outgoing && it.status != MessageStatus.READ }
         if (unread.isEmpty()) return
-        for (m in unread) updateStatus(m.id, MessageStatus.READ)
+        val ids = unread.mapTo(HashSet()) { it.id }
+        updateMessages(ids) { m -> if (m.id in ids) m.copy(status = MessageStatus.READ) else m }
         scope.launch {
             val bySender = unread.filter { it.senderId.isNotEmpty() }.groupBy { it.senderId }
             for ((sender, msgs) in bySender) {
-                val ids = JSONArray(); msgs.forEach { ids.put(it.id) }
+                val ja = JSONArray(); msgs.forEach { ja.put(it.id) }
                 val inner = JSONObject()
                     .put("type", "read")
                     .put("from", _identity.value!!.userId)
-                    .put("ids", ids)
+                    .put("ids", ja)
                     .toString()
                 contactById(sender)?.let { transmit(it, inner, Crypto.INFO_MSG) }
             }
@@ -1056,7 +1129,7 @@ object Repo {
             tls = s.mqttTls,
             clientId = "gizli-" + me.userId,
             topic = topicFor(me.userId),
-            onMessage = { raw -> if (processIncoming(raw)) onNewMessage?.invoke(1) },
+            onMessage = { raw -> if (processIncoming(raw)) notifyIncoming() },
             onConnected = { flushOutbox() },
             torHost = if (s.useTor) s.torHost.ifBlank { "127.0.0.1" } else null,
             torPort = s.torPort
@@ -1088,6 +1161,17 @@ object Repo {
 
     // ---------------- Gelen kutusu ----------------
 
+    @Volatile
+    private var lastIncomingChatId: String = ""
+
+    /** Sessiz olmayan sohbette yeni mesaj varsa bildirim gönderir. */
+    private fun notifyIncoming() {
+        val chatId = lastIncomingChatId
+        if (chatId.isEmpty()) return
+        val muted = contactById(chatId)?.muted == true || groupById(chatId)?.muted == true
+        if (!muted) onNewMessage?.invoke(1)
+    }
+
     /** Tek bir zarfı çözer ve işler; yeni mesaj ise true. */
     fun processIncoming(raw: String): Boolean {
         return try {
@@ -1113,6 +1197,7 @@ object Repo {
         for (raw in envelopes) {
             if (processIncoming(raw)) newCount++
         }
+        if (newCount > 0) notifyIncoming()
         return newCount
     }
 
@@ -1189,6 +1274,7 @@ object Repo {
                         o.optString("file", ""), o.optString("rid", ""), o.optString("rprev", "")
                     )
                 )
+                lastIncomingChatId = gid
                 return true
             }
             "msg" -> {
@@ -1203,6 +1289,7 @@ object Repo {
                         o.optString("file", ""), o.optString("rid", ""), o.optString("rprev", "")
                     )
                 )
+                lastIncomingChatId = from
                 return true
             }
             "typing" -> {
@@ -1211,8 +1298,10 @@ object Repo {
             }
             "read" -> {
                 val ids = o.optJSONArray("ids")
-                if (ids != null) for (i in 0 until ids.length()) {
-                    updateStatus(ids.getString(i), MessageStatus.READ)
+                if (ids != null && ids.length() > 0) {
+                    val idSet = HashSet<String>()
+                    for (i in 0 until ids.length()) idSet.add(ids.getString(i))
+                    updateMessages(idSet) { m -> if (m.id in idSet) m.copy(status = MessageStatus.READ) else m }
                 }
                 return false
             }

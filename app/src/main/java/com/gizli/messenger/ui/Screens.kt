@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -63,11 +64,13 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Reply
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
@@ -95,6 +98,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -186,15 +190,26 @@ fun GizliApp() {
         }
     }
 
-    // Ekran görüntüsü engeli (FLAG_SECURE)
+    // Ekran görüntüsü engeli (FLAG_SECURE) + sistem çubukları temaya göre
     val secure = settings?.secureScreen ?: true
+    val themeId = settings?.theme ?: "default"
     val activity = context as? android.app.Activity
-    LaunchedEffect(secure) {
+    LaunchedEffect(secure, themeId) {
         val w = activity?.window ?: return@LaunchedEffect
         if (secure) w.setFlags(
             android.view.WindowManager.LayoutParams.FLAG_SECURE,
             android.view.WindowManager.LayoutParams.FLAG_SECURE
         ) else w.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        val barColor = when (themeId) {
+            "amoled" -> android.graphics.Color.BLACK
+            "ocean" -> android.graphics.Color.parseColor("#071A24")
+            "sunset" -> android.graphics.Color.parseColor("#1A0F14")
+            "forest" -> android.graphics.Color.parseColor("#0B140C")
+            "violet" -> android.graphics.Color.parseColor("#120A1A")
+            else -> android.graphics.Color.parseColor("#0B0F14")
+        }
+        w.statusBarColor = barColor
+        w.navigationBarColor = barColor
     }
 
     // Ön plan bağlantısı: MQTT ise sürekli açık tut, relay ise sık yokla
@@ -297,6 +312,12 @@ fun GizliApp() {
                         val chatId = s.contactId
                         val group = Repo.groupById(chatId)
                         val contact = Repo.contactById(chatId)
+                        val fwdTargets = remember(contacts, groups) {
+                            buildList {
+                                contacts.forEach { add(Triple(it.userId, it.name, false)) }
+                                groups.forEach { add(Triple(it.id, it.name, true)) }
+                            }
+                        }
                         ChatScreen(
                             title = group?.name ?: contact?.name ?: "Sohbet",
                             avatarB64 = group?.avatarB64 ?: contact?.avatarB64 ?: "",
@@ -319,10 +340,7 @@ fun GizliApp() {
                             },
                             onViewOnce = { mid -> Repo.markViewed(mid) },
                             onReact = { mid, emoji -> Repo.react(chatId, mid, emoji, group != null) },
-                            forwardTargets = buildList {
-                                contacts.forEach { add(Triple(it.userId, it.name, false)) }
-                                groups.forEach { add(Triple(it.id, it.name, true)) }
-                            },
+                            forwardTargets = fwdTargets,
                             onForward = { mid, targetId, targetIsGroup ->
                                 Repo.forwardMessage(chatId, mid, targetId, targetIsGroup)
                             }
@@ -423,6 +441,16 @@ private fun HomeScreen(
     onUpdate: () -> Unit,
     onNewGroup: () -> Unit
 ) {
+    val typingSet by Repo.typing.collectAsState()
+    val meId = Repo.identity.value?.userId ?: ""
+
+    val sortedGroups = remember(groups, allMessages) {
+        groups.sortedByDescending { g -> allMessages[g.id]?.lastOrNull()?.ts ?: g.createdAt }
+    }
+    val sortedContacts = remember(contacts, allMessages) {
+        contacts.sortedByDescending { c -> allMessages[c.userId]?.lastOrNull()?.ts ?: c.addedAt }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -471,32 +499,46 @@ private fun HomeScreen(
             }
         } else {
             LazyColumn(Modifier.fillMaxSize().padding(pad)) {
-                if (groups.isNotEmpty()) {
+                if (sortedGroups.isNotEmpty()) {
                     item { SectionHeader("Gruplar") }
-                    items(groups, key = { it.id }) { g ->
-                        val last = allMessages[g.id]?.lastOrNull()
+                    items(sortedGroups, key = { it.id }) { g ->
+                        val msgs = allMessages[g.id].orEmpty()
+                        val last = msgs.lastOrNull()
+                        val unread = msgs.count { !it.outgoing && it.status != MessageStatus.READ }
                         ConversationRow(
                             title = g.name,
                             subtitle = preview(last),
                             avatarText = g.name.take(1).uppercase(),
                             avatarB64 = g.avatarB64,
                             isGroup = true,
-                            onClick = { onOpen(g.id) }
+                            time = last?.let { timeText(it.ts) },
+                            unread = unread,
+                            muted = g.muted,
+                            typing = typingSet.any { it != meId && g.members.any { m -> m.userId == it } },
+                            onClick = { onOpen(g.id) },
+                            onLongClick = { Repo.setGroupMuted(g.id, !g.muted) }
                         )
                         HorizontalDivider(color = MaterialTheme.colorScheme.outline)
                     }
                 }
-                if (contacts.isNotEmpty()) {
+                if (sortedContacts.isNotEmpty()) {
                     item { SectionHeader("Kişiler") }
-                    items(contacts, key = { it.userId }) { c ->
-                        val last = allMessages[c.userId]?.lastOrNull()
+                    items(sortedContacts, key = { it.userId }) { c ->
+                        val msgs = allMessages[c.userId].orEmpty()
+                        val last = msgs.lastOrNull()
+                        val unread = msgs.count { !it.outgoing && it.status != MessageStatus.READ }
                         ConversationRow(
                             title = c.name,
                             subtitle = preview(last) ?: (c.userId.take(12) + "…"),
                             avatarText = c.name.take(1).uppercase(),
                             avatarB64 = c.avatarB64,
                             isGroup = false,
-                            onClick = { onOpen(c.userId) }
+                            time = last?.let { timeText(it.ts) },
+                            unread = unread,
+                            muted = c.muted,
+                            typing = typingSet.contains(c.userId),
+                            onClick = { onOpen(c.userId) },
+                            onLongClick = { Repo.setContactMuted(c.userId, !c.muted) }
                         )
                         HorizontalDivider(color = MaterialTheme.colorScheme.outline)
                     }
@@ -523,6 +565,7 @@ private fun SectionHeader(title: String) {
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ConversationRow(
     title: String,
@@ -530,29 +573,66 @@ private fun ConversationRow(
     avatarText: String,
     avatarB64: String,
     isGroup: Boolean,
-    onClick: () -> Unit
+    time: String? = null,
+    unread: Int = 0,
+    muted: Boolean = false,
+    typing: Boolean = false,
+    onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null
 ) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(16.dp),
+        Modifier.fillMaxWidth().combinedClickable(onClick = onClick, onLongClick = onLongClick ?: {}).padding(16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         AvatarB64(b64 = avatarB64, fallback = avatarText, size = 44.dp)
         Spacer(Modifier.width(12.dp))
-        Column(Modifier.fillMaxWidth()) {
+        Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 if (isGroup) {
                     Icon(Icons.Filled.Group, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.width(4.dp))
                 }
-                Text(title, fontWeight = FontWeight.SemiBold)
+                Text(title, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f, fill = false))
+                if (muted) {
+                    Spacer(Modifier.width(4.dp))
+                    Icon(
+                        Icons.Filled.NotificationsOff, null,
+                        Modifier.size(14.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
-            if (subtitle != null) {
+            if (typing) {
+                Text("yazıyor…", color = MaterialTheme.colorScheme.primary, fontSize = 13.sp)
+            } else if (subtitle != null) {
                 Text(
                     subtitle,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     fontSize = 13.sp
                 )
+            }
+        }
+        Spacer(Modifier.width(8.dp))
+        Column(horizontalAlignment = Alignment.End) {
+            if (time != null) {
+                Text(time, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (unread > 0) {
+                Spacer(Modifier.height(4.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.primary,
+                    shape = CircleShape,
+                    modifier = Modifier.sizeIn(minWidth = 20.dp, minHeight = 20.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)) {
+                        Text(
+                            if (unread > 99) "99+" else unread.toString(),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onPrimary
+                        )
+                    }
+                }
             }
         }
     }
@@ -586,11 +666,18 @@ fun AvatarB64(b64: String, fallback: String, size: androidx.compose.ui.unit.Dp) 
     }
 }
 
+private val bitmapCache = object : android.util.LruCache<String, android.graphics.Bitmap>(8 * 1024 * 1024) {
+    override fun sizeOf(key: String, value: android.graphics.Bitmap): Int = value.byteCount
+}
+
 private fun decodeB64Bitmap(b64: String): android.graphics.Bitmap? {
     if (b64.isBlank()) return null
+    bitmapCache.get(b64)?.let { return it }
     return runCatching {
         val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
-        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        bitmapCache.put(b64, bmp)
+        bmp
     }.getOrNull()
 }
 
@@ -613,7 +700,7 @@ private fun ChatScreen(
     onForward: (String, String, Boolean) -> Unit
 ) {
     val context = LocalContext.current
-    var text by remember { mutableStateOf("") }
+    var text by remember(chatId) { mutableStateOf(Repo.draftFor(chatId)) }
     var attachMenu by remember { mutableStateOf(false) }
     var pendingOnce by remember { mutableStateOf(false) }
     var viewing by remember { mutableStateOf<Message?>(null) }
@@ -631,9 +718,17 @@ private fun ChatScreen(
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     var highlightId by remember { mutableStateOf<String?>(null) }
+    var searchQuery by remember { mutableStateOf("") }
+    var searchOpen by remember { mutableStateOf(false) }
+
+    DisposableEffect(chatId) {
+        onDispose { Repo.setDraft(chatId, text) }
+    }
 
     fun scrollToMessage(id: String) {
-        val idx = messages.indexOfFirst { it.id == id }
+        val list = if (searchQuery.isBlank()) messages
+        else messages.filter { it.text.contains(searchQuery, true) || it.fileName.contains(searchQuery, true) }
+        val idx = list.indexOfFirst { it.id == id }
         if (idx >= 0) {
             highlightId = id
             scope.launch {
@@ -742,7 +837,7 @@ private fun ChatScreen(
     }
     // Yeni mesaj geldiğinde, kullanıcı zaten alttaysa otomatik kaydır.
     LaunchedEffect(messages.size) {
-        if (messages.isEmpty()) return@LaunchedEffect
+        if (messages.isEmpty() || searchQuery.isNotBlank()) return@LaunchedEffect
         val info = listState.layoutInfo
         val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
         val total = info.totalItemsCount
@@ -767,6 +862,9 @@ private fun ChatScreen(
                     IconButton(onClick = onBack) { Icon(Icons.Filled.ArrowBack, "Geri") }
                 },
                 actions = {
+                    IconButton(onClick = { searchOpen = !searchOpen; if (!searchOpen) searchQuery = "" }) {
+                        Icon(Icons.Filled.Search, "Ara")
+                    }
                     if (onGroupInfo != null) {
                         IconButton(onClick = onGroupInfo) { Icon(Icons.Filled.MoreVert, "Grup bilgisi") }
                     }
@@ -776,6 +874,23 @@ private fun ChatScreen(
         }
     ) { pad ->
         Column(Modifier.fillMaxSize().padding(pad).imePadding()) {
+            if (searchOpen) {
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                    placeholder = { Text("Mesajlarda ara…") },
+                    singleLine = true,
+                    leadingIcon = { Icon(Icons.Filled.Search, null) },
+                    trailingIcon = {
+                        IconButton(onClick = { searchQuery = "" }) { Icon(Icons.Filled.Close, "Temizle") }
+                    }
+                )
+            }
+            val displayMessages = if (searchQuery.isBlank()) messages
+            else messages.filter {
+                it.text.contains(searchQuery, ignoreCase = true) || it.fileName.contains(searchQuery, ignoreCase = true)
+            }
             if (messages.isEmpty()) {
                 Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -796,8 +911,8 @@ private fun ChatScreen(
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp)
                 ) {
-                    itemsIndexed(messages, key = { _, m -> m.id }) { index, m ->
-                        val prev = messages.getOrNull(index - 1)
+                    itemsIndexed(displayMessages, key = { _, m -> m.id }) { index, m ->
+                        val prev = displayMessages.getOrNull(index - 1)
                         if (prev == null || !sameDay(prev.ts, m.ts)) DateSeparator(m.ts)
                         MessageBubble(
                             m = m,
@@ -807,7 +922,8 @@ private fun ChatScreen(
                             onOpenImage = { viewing = m },
                             onLongPress = { menuMsg = m },
                             onReplyClick = { scrollToMessage(it) },
-                            onSwipeReply = { replyTo = m }
+                            onSwipeReply = { replyTo = m },
+                            onDoubleTap = { onReact(m.id, "👍") }
                         )
                     }
                 }
@@ -877,7 +993,7 @@ private fun ChatScreen(
                         IconButton(onClick = {
                             val r = replyTo
                             onSend(text.trim(), r?.id ?: "", r?.let { previewOf(it) } ?: "")
-                            text = ""; replyTo = null
+                            text = ""; replyTo = null; Repo.setDraft(chatId, "")
                         }) { Icon(Icons.Filled.Send, "Gönder", tint = MaterialTheme.colorScheme.primary) }
                     } else {
                         IconButton(
@@ -910,13 +1026,13 @@ private fun ChatScreen(
 
     menuMsg?.let { m ->
         MessageActionsDialog(
-            outgoing = m.outgoing,
             onReply = { replyTo = m; menuMsg = null },
             onReact = { e -> onReact(m.id, e); menuMsg = null },
             onCopy = {
-                if (m.type == "text") {
+                val clip = previewOf(m).ifBlank { m.text }
+                if (clip.isNotBlank()) {
                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                    cm.setPrimaryClip(android.content.ClipData.newPlainText("mesaj", m.text))
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("mesaj", clip))
                 }
                 menuMsg = null
             },
@@ -960,7 +1076,6 @@ private fun ChatScreen(
 
 @Composable
 private fun MessageActionsDialog(
-    outgoing: Boolean,
     onReply: () -> Unit,
     onReact: (String) -> Unit,
     onCopy: () -> Unit,
@@ -984,10 +1099,8 @@ private fun MessageActionsDialog(
                 TextButton(onClick = onForward, modifier = Modifier.fillMaxWidth()) {
                     Icon(Icons.Filled.Share, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("İlet")
                 }
-                if (!outgoing) {
-                    TextButton(onClick = onCopy, modifier = Modifier.fillMaxWidth()) {
-                        Icon(Icons.Filled.ContentCopy, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("Kopyala")
-                    }
+                TextButton(onClick = onCopy, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.ContentCopy, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("Kopyala")
                 }
                 TextButton(onClick = onDelete, modifier = Modifier.fillMaxWidth()) {
                     Icon(Icons.Filled.Delete, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.error)
@@ -1055,7 +1168,8 @@ private fun MessageBubble(
     onOpenImage: () -> Unit,
     onLongPress: () -> Unit,
     onReplyClick: (String) -> Unit,
-    onSwipeReply: () -> Unit
+    onSwipeReply: () -> Unit,
+    onDoubleTap: (() -> Unit)? = null
 ) {
     val isOut = m.outgoing
     val baseColor = if (isOut) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
@@ -1100,7 +1214,11 @@ private fun MessageBubble(
             Surface(
                 color = bubbleColor,
                 shape = RoundedCornerShape(14.dp),
-                modifier = Modifier.combinedClickable(onClick = {}, onLongClick = onLongPress)
+                modifier = Modifier.combinedClickable(
+                    onClick = {},
+                    onLongClick = onLongPress,
+                    onDoubleClick = { onDoubleTap?.invoke() ?: onLongPress() }
+                )
             ) {
                 Column {
                     if (m.replyPreview.isNotBlank()) {

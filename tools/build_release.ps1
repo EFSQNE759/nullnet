@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)][int]$VersionCode,
     [Parameter(Mandatory = $true)][string]$VersionName,
     [string]$Notes = "",
-    [string]$UpdateUrl = "https://github.com/EFSQNE759/nullnet/releases/latest/download/app-release.apk"
+    [string]$ApkUrl = "https://github.com/EFSQNE759/nullnet/releases/latest/download/app-release.apk"
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path | Split-Path -Parent
@@ -17,7 +17,7 @@ try {
     Write-Host "==> Imzali update.json uretiliyor..."
     & python tools\make_update.py `
         --apk app\build\outputs\apk\release\app-release.apk `
-        --url $UpdateUrl `
+        --url $ApkUrl `
         --version-code $VersionCode `
         --version-name $VersionName `
         --notes $Notes `
