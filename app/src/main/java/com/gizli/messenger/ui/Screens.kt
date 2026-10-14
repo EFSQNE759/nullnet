@@ -18,6 +18,9 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Arrangement
@@ -25,6 +28,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -37,6 +41,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -105,9 +110,11 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.graphics.graphicsLayer
@@ -124,6 +131,7 @@ import com.gizli.messenger.update.UpdateInfo
 import com.gizli.messenger.update.UpdateManager
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.text.SimpleDateFormat
@@ -386,7 +394,17 @@ private fun HomeScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("nullnet") },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Image(
+                            painter = painterResource(com.gizli.messenger.R.drawable.ic_logo),
+                            contentDescription = "nullnet",
+                            modifier = Modifier.size(30.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("nullnet", fontWeight = FontWeight.Bold)
+                    }
+                },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface),
                 actions = {
                     IconButton(onClick = onNewGroup) { Icon(Icons.Filled.Group, "Yeni grup") }
@@ -573,11 +591,26 @@ private fun ChatScreen(
     var replyTo by remember { mutableStateOf<Message?>(null) }
     var menuMsg by remember { mutableStateOf<Message?>(null) }
     var forwardMsg by remember { mutableStateOf<Message?>(null) }
+    var deletingMsg by remember { mutableStateOf<Message?>(null) }
     var recording by remember { mutableStateOf(false) }
     var recordSecs by remember { mutableStateOf(0) }
     var recorder by remember { mutableStateOf<MediaRecorder?>(null) }
     var recordFile by remember { mutableStateOf<File?>(null) }
     val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    var highlightId by remember { mutableStateOf<String?>(null) }
+
+    fun scrollToMessage(id: String) {
+        val idx = messages.indexOfFirst { it.id == id }
+        if (idx >= 0) {
+            highlightId = id
+            scope.launch {
+                listState.animateScrollToItem(idx)
+                delay(1500)
+                if (highlightId == id) highlightId = null
+            }
+        }
+    }
 
     val typingSet by Repo.typing.collectAsState()
     val groupMemberIds = remember(chatId, isGroup) {
@@ -671,8 +704,19 @@ private fun ChatScreen(
         }
     }
 
+    // Sohbete girildiğinde her zaman en alta konumlan.
+    LaunchedEffect(chatId) {
+        if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
+    }
+    // Yeni mesaj geldiğinde, kullanıcı zaten alttaysa otomatik kaydır.
     LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.size - 1)
+        if (messages.isEmpty()) return@LaunchedEffect
+        val info = listState.layoutInfo
+        val lastVisible = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+        val total = info.totalItemsCount
+        if (total == 0 || lastVisible >= total - 2 || lastVisible == -1) {
+            listState.animateScrollToItem(messages.size - 1)
+        }
     }
     Scaffold(
         topBar = {
@@ -700,19 +744,40 @@ private fun ChatScreen(
         }
     ) { pad ->
         Column(Modifier.fillMaxSize().padding(pad).imePadding()) {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                items(messages, key = { it.id }) { m ->
-                    MessageBubble(
-                        m = m,
-                        senderName = if (isGroup && !m.outgoing) nameOf(m.senderId) else null,
-                        nameById = nameOf,
-                        onOpenImage = { viewing = m },
-                        onLongPress = { menuMsg = m }
-                    )
+            if (messages.isEmpty()) {
+                Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(Icons.Filled.Lock, null, Modifier.size(40.dp), tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.height(10.dp))
+                        Text("Uçtan uca şifreli sohbet", fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "İlk mesajı sen yaz. Mesajları sağa kaydırarak yanıtlayabilirsin.",
+                            fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            } else {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 8.dp)
+                ) {
+                    itemsIndexed(messages, key = { _, m -> m.id }) { index, m ->
+                        val prev = messages.getOrNull(index - 1)
+                        if (prev == null || !sameDay(prev.ts, m.ts)) DateSeparator(m.ts)
+                        MessageBubble(
+                            m = m,
+                            senderName = if (isGroup && !m.outgoing) nameOf(m.senderId) else null,
+                            nameById = nameOf,
+                            highlighted = m.id == highlightId,
+                            onOpenImage = { viewing = m },
+                            onLongPress = { menuMsg = m },
+                            onReplyClick = { scrollToMessage(it) },
+                            onSwipeReply = { replyTo = m }
+                        )
+                    }
                 }
             }
 
@@ -824,6 +889,7 @@ private fun ChatScreen(
                 menuMsg = null
             },
             onForward = { forwardMsg = m; menuMsg = null },
+            onDelete = { deletingMsg = m; menuMsg = null },
             onDismiss = { menuMsg = null }
         )
     }
@@ -835,6 +901,29 @@ private fun ChatScreen(
             onDismiss = { forwardMsg = null }
         )
     }
+
+    deletingMsg?.let { m ->
+        AlertDialog(
+            onDismissRequest = { deletingMsg = null },
+            title = { Text("Mesajı sil") },
+            text = { Text("Bu mesajı silmek istediğine emin misin?") },
+            confirmButton = {
+                TextButton(onClick = { Repo.deleteMessageLocally(m.id); deletingMsg = null }) {
+                    Text("Benden sil")
+                }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(onClick = { deletingMsg = null }) { Text("Vazgeç") }
+                    if (m.outgoing) {
+                        TextButton(onClick = {
+                            Repo.deleteMessage(chatId, m.id, isGroup); deletingMsg = null
+                        }) { Text("Herkesten sil", color = MaterialTheme.colorScheme.error) }
+                    }
+                }
+            }
+        )
+    }
 }
 
 @Composable
@@ -844,6 +933,7 @@ private fun MessageActionsDialog(
     onReact: (String) -> Unit,
     onCopy: () -> Unit,
     onForward: () -> Unit,
+    onDelete: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val emojis = listOf("👍", "❤️", "😂", "😮", "😢", "🙏")
@@ -866,6 +956,11 @@ private fun MessageActionsDialog(
                     TextButton(onClick = onCopy, modifier = Modifier.fillMaxWidth()) {
                         Icon(Icons.Filled.ContentCopy, null, Modifier.size(18.dp)); Spacer(Modifier.width(8.dp)); Text("Kopyala")
                     }
+                }
+                TextButton(onClick = onDelete, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.Delete, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.error)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Sil", color = MaterialTheme.colorScheme.error)
                 }
             }
         }
@@ -904,21 +999,63 @@ private fun ForwardDialog(
     }
 }
 
+@Composable
+private fun DateSeparator(ts: Long) {
+    Box(Modifier.fillMaxWidth().padding(vertical = 6.dp), contentAlignment = Alignment.Center) {
+        Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(12.dp)) {
+            Text(
+                dayText(ts),
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 3.dp)
+            )
+        }
+    }
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun MessageBubble(
     m: Message,
     senderName: String?,
     nameById: (String) -> String,
+    highlighted: Boolean,
     onOpenImage: () -> Unit,
-    onLongPress: () -> Unit
+    onLongPress: () -> Unit,
+    onReplyClick: (String) -> Unit,
+    onSwipeReply: () -> Unit
 ) {
     val isOut = m.outgoing
-    val bubbleColor = if (isOut) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+    val baseColor = if (isOut) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
     else MaterialTheme.colorScheme.surfaceVariant
+    val bubbleColor = if (highlighted) MaterialTheme.colorScheme.primary.copy(alpha = 0.5f) else baseColor
     val align = if (isOut) Alignment.CenterEnd else Alignment.CenterStart
-    Box(Modifier.fillMaxWidth(), contentAlignment = align) {
-        Column(horizontalAlignment = if (isOut) Alignment.End else Alignment.Start) {
+    var dragX by remember { mutableStateOf(0f) }
+    val dragState = rememberDraggableState { delta -> dragX = (dragX + delta).coerceIn(0f, 220f) }
+    Box(
+        Modifier
+            .fillMaxWidth()
+            .draggable(
+                orientation = Orientation.Horizontal,
+                state = dragState,
+                onDragStopped = {
+                    if (dragX > 120f) onSwipeReply()
+                    dragX = 0f
+                }
+            ),
+        contentAlignment = align
+    ) {
+        if (dragX > 0f) {
+            Icon(
+                Icons.Filled.Reply, null,
+                tint = MaterialTheme.colorScheme.primary.copy(alpha = (dragX / 220f).coerceIn(0f, 1f)),
+                modifier = Modifier.align(Alignment.CenterStart).padding(start = 8.dp).size(20.dp)
+            )
+        }
+        Column(
+            horizontalAlignment = if (isOut) Alignment.End else Alignment.Start,
+            modifier = Modifier.offset { IntOffset(dragX.roundToInt(), 0) }
+        ) {
             if (senderName != null) {
                 Text(
                     senderName,
@@ -940,7 +1077,9 @@ private fun MessageBubble(
                                 .background(
                                     MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
                                     RoundedCornerShape(8.dp)
-                                ).padding(6.dp),
+                                )
+                                .clickable(enabled = m.replyToId.isNotBlank()) { onReplyClick(m.replyToId) }
+                                .padding(6.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(Icons.Filled.Reply, null, Modifier.size(13.dp), tint = MaterialTheme.colorScheme.primary)
@@ -2116,3 +2255,17 @@ private fun shareText(context: Context, text: String) {
 
 private fun timeText(ts: Long): String =
     SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(ts))
+
+private fun dayKey(ts: Long): String =
+    SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(Date(ts))
+
+private fun sameDay(a: Long, b: Long): Boolean = dayKey(a) == dayKey(b)
+
+private fun dayText(ts: Long): String {
+    val now = System.currentTimeMillis()
+    return when {
+        sameDay(ts, now) -> "Bugün"
+        sameDay(ts, now - 86_400_000L) -> "Dün"
+        else -> SimpleDateFormat("d MMMM yyyy", Locale.getDefault()).format(Date(ts))
+    }
+}

@@ -686,6 +686,44 @@ object Repo {
         updateMessage(id) { it.copy(viewed = true, text = "") }
     }
 
+    /** Bir mesajı yalnızca bu cihazdan siler. */
+    fun deleteMessageLocally(msgId: String) {
+        val map = _messages.value.toMutableMap()
+        var changed = false
+        for ((chatId, list) in map) {
+            if (list.any { it.id == msgId }) {
+                map[chatId] = list.filterNot { it.id == msgId }
+                changed = true
+            }
+        }
+        if (changed) { _messages.value = map; persistMessages() }
+    }
+
+    /** Bir mesajı karşı taraftan da (herkesten) siler. */
+    fun deleteMessage(chatId: String, msgId: String, isGroup: Boolean) {
+        val me = _identity.value!!.userId
+        deleteMessageLocally(msgId)
+        scope.launch {
+            val inner = JSONObject()
+                .put("type", "delete")
+                .put("from", me)
+                .put("id", msgId)
+                .put("gid", if (isGroup) chatId else "")
+                .toString()
+            if (isGroup) {
+                groupById(chatId)?.let { g ->
+                    for (m in g.members) {
+                        if (m.userId == me) continue
+                        val c = contactById(m.userId) ?: continue
+                        transmit(c, inner, Crypto.INFO_MSG)
+                    }
+                }
+            } else {
+                contactById(chatId)?.let { transmit(it, inner, Crypto.INFO_MSG) }
+            }
+        }
+    }
+
     private fun persistMessages() {
         val root = JSONObject()
         for ((contactId, list) in _messages.value) {
@@ -1070,7 +1108,7 @@ object Repo {
         val existing = contactById(from)
 
         // Geçici bilgi paketleri (yazıyor/okundu/tepki) yeni kişi oluşturmaz.
-        if (existing == null && (type == "typing" || type == "read" || type == "reaction")) return false
+        if (existing == null && (type == "typing" || type == "read" || type == "reaction" || type == "delete")) return false
 
         val avatar = if (o.has("avatar")) o.optString("avatar", "") else null
         val bio = if (o.has("bio")) o.optString("bio", "") else null
@@ -1167,6 +1205,11 @@ object Repo {
                     if (emoji.isBlank()) cur.remove(from) else cur[from] = emoji
                     it.copy(reactions = cur)
                 }
+                return false
+            }
+            "delete" -> {
+                val mid = o.optString("id", "")
+                if (mid.isNotEmpty()) deleteMessageLocally(mid)
                 return false
             }
             "hello" -> {
