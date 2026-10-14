@@ -151,6 +151,8 @@ fun GizliApp() {
 
     var screen by remember { mutableStateOf<Screen>(Screen.Home) }
     var showCreateGroup by remember { mutableStateOf(false) }
+    var autoProgress by remember { mutableStateOf<Int?>(null) }
+    var autoChecked by remember { mutableStateOf(false) }
 
     // Ekran görüntüsü engeli (FLAG_SECURE)
     val secure = settings?.secureScreen ?: true
@@ -181,8 +183,54 @@ fun GizliApp() {
         }
     }
 
+    // Açılışta otomatik güncelleme: imzalı yeni sürüm varsa indir ve kur.
+    LaunchedEffect(identity, locked, settings?.autoUpdate) {
+        if (autoChecked) return@LaunchedEffect
+        val me = identity ?: return@LaunchedEffect
+        if (locked) return@LaunchedEffect
+        if (me.displayName.isBlank()) return@LaunchedEffect
+        if (settings?.autoUpdate != true) { autoChecked = true; return@LaunchedEffect }
+        autoChecked = true
+        val um = UpdateManager(context.applicationContext)
+        val info = um.checkForUpdate().getOrNull() ?: return@LaunchedEffect
+        if (!um.canInstallPackages()) {
+            Toast.makeText(context, "Güncelleme (v${info.versionName}) hazır — kurulum izni ver.", Toast.LENGTH_LONG).show()
+            um.openInstallPermissionSettings()
+            return@LaunchedEffect
+        }
+        autoProgress = 0
+        val res = um.downloadApk(info) { p -> autoProgress = p }
+        autoProgress = null
+        res.fold(
+            onSuccess = { file ->
+                Toast.makeText(context, "Güncelleme kuruluyor…", Toast.LENGTH_SHORT).show()
+                um.install(file)
+            },
+            onFailure = { Toast.makeText(context, "Güncelleme hatası: ${it.message}", Toast.LENGTH_LONG).show() }
+        )
+    }
+
     GizliTheme(themeId = settings?.theme ?: "default") {
         val id = identity
+        autoProgress?.let { p ->
+            AlertDialog(
+                onDismissRequest = {},
+                confirmButton = {},
+                title = { Text("Güncelleniyor") },
+                text = {
+                    Column {
+                        Text("Yeni sürüm indiriliyor, lütfen bekleyin…")
+                        Spacer(Modifier.height(12.dp))
+                        LinearProgressIndicator(
+                            progress = { p / 100f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text("%$p", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            )
+        }
         when {
             id == null -> CenterLoading()
             locked -> LockScreen()
@@ -1669,6 +1717,21 @@ private fun SettingsScreen(onBack: () -> Unit, onWiped: () -> Unit) {
                         Repo.setBackgroundPolling(on)
                         if (on) PollService.start(context) else PollService.stop(context)
                     }
+                )
+            }
+
+            Spacer(Modifier.height(24.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Açılışta otomatik güncelle", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Uygulama açıldığında imzalı yeni sürümü otomatik indirir ve kurulum ekranını açar.",
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = settings?.autoUpdate == true,
+                    onCheckedChange = { Repo.setAutoUpdate(it) }
                 )
             }
 

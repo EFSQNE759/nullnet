@@ -215,6 +215,11 @@ object Repo {
         persistSettings()
     }
 
+    fun setAutoUpdate(enabled: Boolean) {
+        _settings.value = _settings.value!!.copy(autoUpdate = enabled)
+        persistSettings()
+    }
+
     /** pin=null ise kilidi kapatır. duressPin verilirse zorlama (duress) PIN'i de ayarlanır. */
     fun setLock(pin: String?, duressPin: String?) {
         val cur = _settings.value ?: return
@@ -272,6 +277,7 @@ object Repo {
             .put("duressHash", s.duressHash)
             .put("duressSalt", s.duressSalt)
             .put("biometricEnabled", s.biometricEnabled)
+            .put("autoUpdate", s.autoUpdate)
         SecureStore.writeSecureString(settingsFile, o.toString())
     }
 
@@ -295,7 +301,8 @@ object Repo {
             o.optString("pinSalt", ""),
             o.optString("duressHash", ""),
             o.optString("duressSalt", ""),
-            o.optBoolean("biometricEnabled", false)
+            o.optBoolean("biometricEnabled", false),
+            o.optBoolean("autoUpdate", true)
         )
     }
 
