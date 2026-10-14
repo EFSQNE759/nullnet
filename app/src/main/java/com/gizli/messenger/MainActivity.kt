@@ -4,14 +4,14 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import com.gizli.messenger.data.Repo
 import com.gizli.messenger.ui.GizliApp
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
 
     private var backgroundedAt = 0L
 

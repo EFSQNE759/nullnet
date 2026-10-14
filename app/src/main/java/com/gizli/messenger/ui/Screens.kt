@@ -10,6 +10,9 @@ import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -1074,9 +1077,46 @@ private fun ImageViewer(message: Message, onClose: () -> Unit, onDownload: (() -
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun LockScreen() {
+    val ctx = LocalContext.current
+    val activity = ctx as? FragmentActivity
     var pin by remember { mutableStateOf("") }
     var error by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
+
+    val biometricEnabled = Repo.settings.value?.biometricEnabled == true
+    val canBiometric = remember(ctx) {
+        BiometricManager.from(ctx)
+            .canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) == BiometricManager.BIOMETRIC_SUCCESS
+    }
+
+    val prompt = remember(activity) {
+        if (activity == null) null
+        else BiometricPrompt(
+            activity,
+            androidx.core.content.ContextCompat.getMainExecutor(ctx),
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    Repo.unlock()
+                }
+            }
+        )
+    }
+
+    fun showBiometric() {
+        val p = prompt ?: return
+        p.authenticate(
+            BiometricPrompt.PromptInfo.Builder()
+                .setTitle("nullnet kilidi")
+                .setSubtitle("Devam etmek için doğrula")
+                .setNegativeButtonText("PIN kullan")
+                .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_WEAK)
+                .build()
+        )
+    }
+
+    LaunchedEffect(Unit) {
+        if (biometricEnabled && canBiometric) showBiometric()
+    }
+
     Scaffold { pad ->
         Column(
             Modifier.fillMaxSize().padding(pad).padding(24.dp),
@@ -1117,6 +1157,12 @@ private fun LockScreen() {
                 enabled = pin.length >= 4,
                 modifier = Modifier.fillMaxWidth()
             ) { Text("Aç") }
+            if (biometricEnabled && canBiometric) {
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(onClick = { showBiometric() }, modifier = Modifier.fillMaxWidth()) {
+                    Text("Parmak izi / Yüz ile aç")
+                }
+            }
         }
     }
 }
@@ -1468,6 +1514,26 @@ private fun SettingsScreen(onBack: () -> Unit, onWiped: () -> Unit) {
                 )
             }
             lockMsg?.let { Text(it, color = MaterialTheme.colorScheme.primary, fontSize = 13.sp) }
+            Spacer(Modifier.height(12.dp))
+            val canBio = remember(context) {
+                BiometricManager.from(context)
+                    .canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) == BiometricManager.BIOMETRIC_SUCCESS
+            }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Biyometrik ile aç", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (canBio) "Parmak izi / yüz ile kilidi aç. Ayarlıysa PIN yerine kullanılır."
+                        else "Bu cihazda biyometrik yok.",
+                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Switch(
+                    checked = settings?.biometricEnabled == true,
+                    onCheckedChange = { Repo.setBiometric(it) },
+                    enabled = canBio && settings?.lockEnabled == true
+                )
+            }
 
             Spacer(Modifier.height(24.dp))
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {

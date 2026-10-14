@@ -205,9 +205,14 @@ object Repo {
     // ---------------- Uygulama kilidi ----------------
 
     private fun hashPin(pin: String, salt: String): String {
-        val md = java.security.MessageDigest.getInstance("SHA-256")
-        val d = md.digest((salt + ":" + pin).toByteArray(Charsets.UTF_8))
+        // Yavaş KDF (PBKDF2) — PIN kaba kuvvetini zorlaştırır.
+        val d = Crypto.deriveKey(pin, B64.dec(salt))
         return B64.enc(d)
+    }
+
+    fun setBiometric(enabled: Boolean) {
+        _settings.value = _settings.value!!.copy(biometricEnabled = enabled)
+        persistSettings()
     }
 
     /** pin=null ise kilidi kapatır. duressPin verilirse zorlama (duress) PIN'i de ayarlanır. */
@@ -266,6 +271,7 @@ object Repo {
             .put("pinSalt", s.pinSalt)
             .put("duressHash", s.duressHash)
             .put("duressSalt", s.duressSalt)
+            .put("biometricEnabled", s.biometricEnabled)
         SecureStore.writeSecureString(settingsFile, o.toString())
     }
 
@@ -288,7 +294,8 @@ object Repo {
             o.optString("pinHash", ""),
             o.optString("pinSalt", ""),
             o.optString("duressHash", ""),
-            o.optString("duressSalt", "")
+            o.optString("duressSalt", ""),
+            o.optBoolean("biometricEnabled", false)
         )
     }
 

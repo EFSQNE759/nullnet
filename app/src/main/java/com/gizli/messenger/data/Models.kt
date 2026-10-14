@@ -72,5 +72,6 @@ data class Settings(
     val pinHash: String = "",
     val pinSalt: String = "",
     val duressHash: String = "",
-    val duressSalt: String = ""
+    val duressSalt: String = "",
+    val biometricEnabled: Boolean = false
 )
