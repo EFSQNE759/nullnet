@@ -216,14 +216,15 @@ fun GizliApp() {
     LaunchedEffect(identity, settings) {
         if (!identity?.displayName.isNullOrBlank()) {
             if (settings?.transport == "mqtt") {
-                Repo.connectMqtt()
+                Repo.maintenance()
                 while (true) {
                     delay(30000)
-                    Repo.connectMqtt()
+                    Repo.maintenance()
                 }
             } else {
                 while (true) {
                     runCatching { Repo.pollOnce() }
+                    runCatching { Repo.maintenance() }
                     delay(3000)
                 }
             }

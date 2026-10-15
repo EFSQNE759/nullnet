@@ -1166,10 +1166,75 @@ object Repo {
 
     /** Sessiz olmayan sohbette yeni mesaj varsa bildirim gönderir. */
     private fun notifyIncoming() {
-        val chatId = lastIncomingChatId
-        if (chatId.isEmpty()) return
-        val muted = contactById(chatId)?.muted == true || groupById(chatId)?.muted == true
-        if (!muted) onNewMessage?.invoke(1)
+        try {
+            val chatId = lastIncomingChatId
+            if (chatId.isEmpty()) return
+            val muted = contactById(chatId)?.muted == true || groupById(chatId)?.muted == true
+            if (!muted) onNewMessage?.invoke(1)
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Periyodik bakım: bağlantıyı canlı tutar, bekleyen outbox'ı boşaltır ve
+     * durumu PENDING/FAILED kalmış giden mesajları yeniden gönderir.
+     * (Alıcı mesaj kimliğine göre yineler; çift gönderim zararsızdır.)
+     */
+    fun maintenance() {
+        if (_settings.value?.transport == "mqtt") {
+            connectMqtt()
+            flushOutbox()
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastRetryAt > 60_000) {
+            lastRetryAt = now
+            retryUnsent()
+        }
+    }
+
+    @Volatile private var lastRetryAt = 0L
+
+    private fun retryUnsent() {
+        val me = _identity.value ?: return
+        for ((chatId, list) in _messages.value) {
+            val isGroup = groupById(chatId) != null
+            val contact = if (isGroup) null else contactById(chatId) ?: continue
+            for (m in list) {
+                if (!m.outgoing || m.text.isBlank()) continue
+                if (m.status != MessageStatus.PENDING && m.status != MessageStatus.FAILED) continue
+                if (System.currentTimeMillis() - m.ts < 20_000) continue
+                scope.launch {
+                    if (isGroup) {
+                        val g = groupById(chatId) ?: return@launch
+                        val inner = JSONObject()
+                            .put("type", "group_msg")
+                            .put("from", me.userId)
+                            .put("name", me.displayName)
+                            .put("gid", chatId)
+                            .put("gname", g.name)
+                            .put("mtype", m.type)
+                            .put("once", m.viewOnce)
+                            .put("file", m.fileName)
+                            .put("rid", m.replyToId)
+                            .put("rprev", m.replyPreview)
+                            .put("body", m.text)
+                            .put("ts", m.ts)
+                            .put("id", m.id)
+                            .toString()
+                        var anyOk = false
+                        for (mem in g.members) {
+                            if (mem.userId == me.userId) continue
+                            val c = contactById(mem.userId) ?: continue
+                            if (transmit(c, inner, Crypto.INFO_MSG)) anyOk = true
+                        }
+                        if (anyOk) updateStatus(m.id, MessageStatus.SENT)
+                    } else {
+                        val inner = innerMessage(contact!!, m.text, m.ts, m.id, m.type, m.viewOnce, m.fileName, m.replyToId, m.replyPreview)
+                        if (transmit(contact, inner, Crypto.INFO_MSG)) updateStatus(m.id, MessageStatus.SENT)
+                    }
+                }
+            }
+        }
     }
 
     /** Tek bir zarfı çözer ve işler; yeni mesaj ise true. */
@@ -1232,6 +1297,12 @@ object Repo {
             )
         } else {
             updateContactProfile(from, nameOpt ?: "", avatar, bio)
+            // Zarfın açık anahtarı kayıtlıkinden farklıysa güncelle: eski anahtara
+            // şifrelenen giden mesajlar karşı tarafta sessizce düşer.
+            val cur = contactById(from)
+            if (cur != null && cur.publicKey != senderPubB64) {
+                upsertContact(cur.copy(publicKey = senderPubB64))
+            }
         }
 
         when (type) {
